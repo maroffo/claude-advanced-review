@@ -1,0 +1,31 @@
+# ABOUTME: Ignore caches, runtime artifacts, and local review output
+# ABOUTME: Keep repo lean; all generated data stays out of VCS
+
+# Validator cache (CWE MITRE JSON, URL reachability cache)
+.cache/
+cwe-mitre.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Test output
+review-tests/
+review-output/
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Temp prompt files produced by orchestrator
+/tmp/advanced-review-*
