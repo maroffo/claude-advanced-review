@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from validator import validator as V
-from runner import test_runner as TR
 from merge import merger as MG
 import orchestrator as O
 
