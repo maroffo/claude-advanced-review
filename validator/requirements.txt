@@ -1,0 +1,8 @@
+# ABOUTME: Runtime deps for validator.py
+# ABOUTME: Kept minimal: stdlib covers most, only HTTP + test deps here
+
+requests>=2.31.0
+
+# Test-only
+pytest>=8.0.0
+pytest-mock>=3.12.0

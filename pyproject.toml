@@ -1,0 +1,22 @@
+# ABOUTME: Project config for pytest discovery and uv-managed venv
+# ABOUTME: Minimal; the skill itself is invoked via shell, not installed as a package
+
+[project]
+name = "claude-advanced-review"
+version = "0.1.0"
+description = "Advanced code review skill with verifiable claims"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
