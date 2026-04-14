@@ -1,0 +1,19 @@
+diff --git a/app.py b/app.py
+index 0000000..1111111 100644
+--- a/app.py
++++ b/app.py
+@@ -11,10 +11,12 @@ class UserService:
+
+     def get_by_name(self, username: str):
+         cursor = self.conn.cursor()
+-        cursor.execute("SELECT * FROM users WHERE name = %s", (username,))
++        # BUG: classic CWE-89 SQL injection via string concat.
++        query = "SELECT * FROM users WHERE name = '" + username + "'"
++        cursor.execute(query)
+         return cursor.fetchone()
+
+     def divide(self, a: int, b: int) -> float:
+-        if b == 0:
+-            raise ValueError("divide by zero")
++        # BUG: no zero-division guard. A red-green test should fail on this.
+         return a / b
