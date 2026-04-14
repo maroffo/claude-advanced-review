@@ -1,144 +1,212 @@
 ---
 name: advanced-review
-description: "Thorough code review using two isolated reviewers (Claude + Gemini in Docker containers). Use when user says advanced review, thorough review, deep review, or /advanced-review. Runs both reviewers in parallel on the same diff, synthesizes findings. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running, claude-reviewer:latest and gemini-reviewer:latest images built."
+description: "Thorough code review with verifiable claims. Dual isolated reviewers (Claude + Gemini in Docker), deterministic validator, Semgrep as third reviewer, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, semgrep/semgrep:latest images available; Python 3.10+ on host for the validator."
 ---
 
-# ABOUTME: Thorough code review using two isolated Docker reviewers (Claude + Gemini)
-# ABOUTME: Same diff to both, zero config contamination, merged findings by severity
+# ABOUTME: Advanced code review with verifiable claims and hostile cross-check
+# ABOUTME: Kills hallucinations before they reach the human reviewer
 
-# Advanced Review (Isolated Dual Reviewer)
+# Advanced Review (Verifiable Claims Edition)
 
-Both reviewers run in Docker with NO access to your `~/.claude/` config, memories,
-or rules. They review the same diff independently, then findings are merged.
+Two LLM reviewers run in isolated Docker containers, a deterministic validator
+filters unprovable claims, Semgrep provides a zero-hallucination ground truth,
+and a hostile cross-check round tries to demolish what survives. Humans only
+see findings that cleared every gate.
 
 ## Trigger
 
-Activate when user says: "advanced review", "thorough review", "deep review", or `/advanced-review`.
+Activate when the user says: "advanced review", "thorough review", "deep review",
+or `/advanced-review`.
 
 ## Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--all` | Review all uncommitted changes | staged only |
-| `--branch [base]` | Review current branch vs base | main |
-| `--prompt <name>` | Prompt template: `default` or `ci-style` | default |
+| `--branch [base]` | Review current branch vs base | `main` |
+| `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
+| `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
+| `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
 
 ## Execution Flow
 
-### Step 1: Generate the diff
+The orchestrator script at `orchestrator.sh` runs these steps in order. Each
+step feeds the next; any step producing zero findings short-circuits the rest
+cleanly.
+
+### Step 1 — Generate the diff
 
 ```bash
-# Default: staged changes
+# Default: staged only
 DIFF=$(git diff --cached)
-
-# With --all: all uncommitted
+# --all: everything uncommitted
 DIFF=$(git diff HEAD)
-
-# With --branch [base]: branch diff
-DIFF=$(git diff main...HEAD)
+# --branch [base]: branch diff
+DIFF=$(git diff "${BASE:-main}"...HEAD)
 ```
 
-If the diff is empty, inform the user and suggest `git add`, `--all`, or `--branch`.
+If the diff is empty, stop and tell the user to `git add`, pass `--all`, or
+pass `--branch`.
 
-### Step 2: Build the review prompt
+### Step 2 — Round 1 reviewers (parallel)
 
-Load the template and compose the full prompt with the diff:
+Both reviewers receive the same prompt and diff. Output is JSON following the
+schema in `prompts/default.md`: each finding carries `category`, `severity`,
+`file:line`, `problem`, `suggestion`, and an `evidence` object whose required
+fields depend on the category:
 
-```bash
-PROMPT_TEMPLATE=$(cat ~/.claude/skills/advanced-review/prompts/default.md)
+| Category | Evidence required |
+|----------|-------------------|
+| `security` | `cwe_id`, `cwe_url` |
+| `bug` | `test` (code) + `test_language` + `test_target_file` (optional `test_modifies_existing`) |
+| `performance` | `benchmark` (code) OR `big_o` (derivation) |
+| `convention` | `convention_file` + `convention_line_or_grep` |
+| `architecture` | `principle` + `application` (specific to the diff) |
+| `nitpick` | none, auto-demoted to `INFO` |
 
-PROMPT_FILE=$(mktemp)
-cat > "$PROMPT_FILE" <<PROMPT_EOF
-$PROMPT_TEMPLATE
+Launch in parallel (single message, two Bash calls):
 
-## Code Changes to Review
-
-\`\`\`diff
-$DIFF
-\`\`\`
-PROMPT_EOF
-```
-
-The prompt file is identical for both reviewers.
-
-### Step 3: Call both reviewers in parallel
-
-Launch **two parallel Bash tool calls in a single message**.
-
-Call 1 - Isolated Claude:
 ```bash
 docker run --rm \
   -v claude-reviewer-auth:/home/node/.claude:ro \
-  -v <PROJECT_ROOT>:/workspace:ro \
-  claude-reviewer:latest \
-  --print \
-  --model opus \
-  "$(cat <PROMPT_FILE>)"
+  -v "$PROJECT_ROOT:/workspace:ro" \
+  claude-reviewer:latest --print --model opus \
+  "$(cat "$PROMPT_FILE")"
 ```
 
-Call 2 - Isolated Gemini:
 ```bash
 docker run --rm \
   -e GEMINI_API_KEY="$(cat ~/.config/gemini-api-key)" \
-  -v <PROJECT_ROOT>:/workspace:ro \
-  gemini-reviewer:latest \
-  -p "$(cat <PROMPT_FILE>)" \
-  -m gemini-3.1-pro-preview \
-  --sandbox false \
-  2>&1 | grep -v "^\[WARN\] Skipping unreadable" | grep -v "^Warning: Could not read"
+  -v "$PROJECT_ROOT:/workspace:ro" \
+  gemini-reviewer:latest -p "$(cat "$PROMPT_FILE")" \
+  -m gemini-3.1-pro-preview --sandbox false
 ```
 
-**Cleanup:**
-```bash
-rm -f "$PROMPT_FILE"
-```
+### Step 3 — Deterministic validator
 
-### Step 4: Merge and present findings
+`validator/validator.py` reads the merged round-1 findings and runs five checks:
 
-Deduplicate and merge findings from both reviewers into a single report:
+1. **CWE existence**: `cwe_id` must exist in the MITRE CWE list (downloaded
+   on first run, cached at `~/.cache/claude-advanced-review/cwe.json` with 30d
+   TTL).
+2. **URL reachability**: `cwe_url` must return HTTP 200 (HEAD, 5s timeout).
+3. **Test syntax**: `evidence.test` must parse as valid code in its declared
+   language (Python `ast`, JS/TS via regex-level check, Go via `go/parser`,
+   etc.).
+4. **Relevance**: the test must reference at least one symbol or file path
+   from the diff (AST scan of imports/calls).
+5. **REFUTE citation**: for round-2 REFUTE-BY-EXPLANATION verdicts, cited
+   `file:line` must exist inside the diff hunks (grep-style check).
 
-#### Critical Issues
-List issues flagged CRITICAL by either reviewer. If both flagged the same issue,
-note "(both reviewers)" for stronger signal.
+Findings that fail their required checks are **dropped** (logged for
+transparency). Findings move forward with `validator_status: "passed"`.
 
-#### Warnings
-Same merge logic. Deduplicate by file:line when both found the same issue.
+### Step 4 — External test runner
 
-#### Suggestions
-Combine unique suggestions from both.
+`runner/test-runner.sh` takes surviving `bug` findings and executes their
+proposed tests against the current codebase. The runner detects project
+toolchain by glob:
 
-#### Agreement Summary
+| Marker file | Runner |
+|-------------|--------|
+| `pyproject.toml` / `setup.py` | `pytest` |
+| `package.json` | `npm test` / `yarn test` / `pnpm test` (detected from lockfile) |
+| `go.mod` | `go test ./...` targeting the affected package |
+| `Cargo.toml` | `cargo test` |
+| `Gemfile` | `rspec` / `rails test` |
 
-| Finding | Claude | Gemini | Action |
-|---------|--------|--------|--------|
-| ... | CRITICAL | CRITICAL | Must fix (strong signal) |
-| ... | WARNING | not flagged | Review manually |
-| ... | not flagged | WARNING | Review manually |
+**Rule:** the test must FAIL on the current code. If it passes, the bug is not
+demonstrated and the finding is dropped. Surviving tests are saved to
+`review-tests/<finding-id>.{py,ts,go,...}` for the IMPLEMENT step of the
+verification protocol (red-green contract for the engineer doing the fix).
 
-**Key insight:** Issues flagged by both reviewers independently are high-confidence
-findings. Issues flagged by only one reviewer warrant a closer look but may be
-false positives.
+**Modify-existing preference:** when the reviewer sets
+`evidence.test_modifies_existing: true`, the runner applies the test as a
+patch to the referenced existing test file rather than creating a new one,
+inheriting imports and fixtures. Hard fallback to new file if the referenced
+file doesn't exist.
+
+### Step 5 — Semgrep (third reviewer, ground truth)
+
+`runner/semgrep-runner.sh` runs `semgrep/semgrep:latest` with `--config=auto`
+on the project. Output is parsed into the same finding schema used by the LLM
+reviewers. Semgrep findings are tagged `source: "semgrep"` and **skip the
+validator**: they are ground truth by construction.
+
+Semgrep's role:
+- Findings neither LLM caught: added to the final report directly.
+- LLM findings overlapping with Semgrep: severity bumped to `HIGH_CONFIDENCE`.
+- LLM security findings NOT corroborated by Semgrep: flagged for extra
+  scrutiny in round 2.
+
+Skip with `--no-semgrep`.
+
+### Step 6 — Round 2 cross-check (hostile defense)
+
+Only `CRITICAL` and `WARNING` findings enter round 2. Each LLM reviewer
+receives the other's findings and is prompted (see `prompts/cross-check.md`)
+to **prove them false**. Default stance is adversarial; ACCEPT is the fallback
+when they cannot debunk.
+
+Four verdicts:
+
+| Verdict | Meaning | Requires |
+|---------|---------|----------|
+| `ACCEPT` | Could not debunk | (nothing) |
+| `MODIFY` | Claim valid but severity or fix is wrong | corrected version |
+| `REJECT-WITH-COUNTER-EVIDENCE` | Claim is wrong, here's the hard proof | own evidence (test that passes on current code, CWE disputing the mapping, etc.) |
+| `REFUTE-BY-EXPLANATION` | Claim is wrong, here's why in prose | `file:line` citations inside the diff that contradict the claim (validated in step 3) |
+
+Launched in parallel as two fresh stateless Docker calls (same image and auth
+as round 1, different prompt).
+
+### Step 7 — Merge
+
+| Round 1 flag | Cross-check outcome | Action |
+|--------------|---------------------|--------|
+| flagged | both ACCEPT | `HIGH_CONFIDENCE`, surface prominently |
+| flagged | one ACCEPT, one MODIFY | Present both versions, note the divergence |
+| flagged | any REJECT-WITH-COUNTER-EVIDENCE | `DISPUTED`, human decides |
+| flagged | any REFUTE-BY-EXPLANATION (validated) | `DISPUTED`, human decides |
+| flagged | REFUTE with invalid citation | Original claim wins (REFUTE discarded) |
+| (semgrep only) | n/a | `GROUND_TRUTH`, added directly |
+
+The final report is markdown with sections by severity, each finding showing:
+- Source reviewer(s) and verdict chain
+- `file:line`, problem, suggested fix
+- Linked evidence (CWE link, saved test path, benchmark excerpt)
+- Confidence tag (`HIGH_CONFIDENCE` / `MODIFIED` / `DISPUTED` / `GROUND_TRUTH`)
+
+`review-tests/` is preserved for the engineer doing the fix.
 
 ## When to Use
 
 - Before opening a PR (thorough review)
 - After significant refactors
 - Security-sensitive changes
-- When you want higher confidence than a single reviewer
+- When the cost of a missed issue is higher than the cost of running the full
+  pipeline (roughly 2x LLM cost of v1 plus the Semgrep container)
 
 ## When NOT to Use
 
 - Quick pre-commit check (use `gemini-review`)
 - Trivial changes (typos, formatting)
 - When Docker is not running
+- When you only need a style review (Semgrep and convention checks are cheaper
+  standalone)
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| "docker: command not found" | Start Docker Desktop |
-| Image not found | Build: `cd docker/isolated-reviewer && docker build -t claude-reviewer:latest .` |
-| Claude auth fails | Re-login: see `isolated-review.sh --login` |
-| Gemini API errors | Check `~/.config/gemini-api-key` |
-| Large diff timeout | Use `--branch` with specific file paths, or split the review |
+| `docker: command not found` | Start Docker Desktop |
+| `claude-reviewer` image missing | Build: `cd claude-forge/docker/isolated-reviewer && docker build -t claude-reviewer:latest .` |
+| `gemini-reviewer` image missing | Build: `cd claude-forge/docker/isolated-gemini && docker build -t gemini-reviewer:latest .` |
+| `semgrep/semgrep` image missing | `docker pull semgrep/semgrep:latest` |
+| Claude auth fails | Re-login: `docker run -it --rm -v claude-reviewer-auth:/home/node/.claude --entrypoint bash claude-reviewer:latest -c "claude login"` |
+| Gemini API errors | Check `~/.config/gemini-api-key` exists and is valid |
+| Validator: "CWE list not found" | Delete `~/.cache/claude-advanced-review/cwe.json` and rerun (forces refresh) |
+| Test runner: "toolchain not detected" | Pass `--no-test-runner` to skip, or add a marker file the runner recognizes |
+| Large diff timeout | Split by file path with `--branch` scoping, or review commit-by-commit |
+| Findings survive everything but feel wrong | Check the `review-tests/` output, a surviving red-green test is usually the strongest signal |
