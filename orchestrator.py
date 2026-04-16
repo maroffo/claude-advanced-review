@@ -1,5 +1,5 @@
 # ABOUTME: End-to-end orchestrator for claude-advanced-review
-# ABOUTME: Glue: diff -> round1 -> validate -> test-run -> semgrep -> sonarqube -> round2 -> merge -> report
+# ABOUTME: Glue: preflight -> diff -> round1 -> validate -> test-run -> semgrep -> sonarqube -> round2 -> merge
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from validator import validator as V  # noqa: E402
 from runner import test_runner as TR  # noqa: E402
 from runner import semgrep_runner as SR  # noqa: E402
 from runner import sonarqube_runner as SQ  # noqa: E402
+from runner import preflight_runner as PF  # noqa: E402
 from merge import merger as MG  # noqa: E402
 
 
@@ -169,6 +170,22 @@ def pipeline(args: argparse.Namespace) -> int:
     if not (project_root / ".git").exists():
         print(f"not a git repo: {project_root}", file=sys.stderr)
         return 2
+
+    # 0) Pre-flight: make check
+    if not args.no_preflight:
+        if PF.detect_check_target(project_root):
+            print("preflight: running make check...", file=sys.stderr)
+            pf = PF.run_preflight(project_root)
+            if not pf.passed:
+                print("preflight: FAILED. Fix before review.\n",
+                      file=sys.stderr)
+                print(pf.output, file=sys.stderr)
+                return 3
+            print("preflight: passed", file=sys.stderr)
+        else:
+            print("preflight: no make check target found, skipping "
+                  "(run /project-checks to scaffold one)",
+                  file=sys.stderr)
 
     # 1) Diff
     diff_text = generate_diff(project_root, args.diff_mode, args.base)
@@ -341,6 +358,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                       help="Review current branch vs BASE (default main)")
     parser.add_argument("--prompt", default="default",
                         choices=("default", "ci-style"))
+    parser.add_argument("--no-preflight", action="store_true")
     parser.add_argument("--no-semgrep", action="store_true")
     parser.add_argument("--no-sonarqube", action="store_true")
     parser.add_argument("--no-cross-check", action="store_true")
