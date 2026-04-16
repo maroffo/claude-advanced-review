@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from runner import sonarqube_runner as SQ
 
