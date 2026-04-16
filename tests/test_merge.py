@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from merge.merger import classify_confidence, build_report
+from merge.merger import classify_confidence, build_report, deduplicate_findings
 
 
 def _accept(finding_id: str = "f1") -> dict:
@@ -105,3 +105,62 @@ class TestBuildReport:
     def test_no_sonarqube_section_when_empty(self):
         report = build_report([], sonar_findings=[])
         assert "## SonarQube (ground truth)" not in report
+
+
+class TestDeduplicateFindings:
+    def test_removes_exact_duplicates(self):
+        findings = [
+            {"file": "a.py", "category": "bug", "severity": "WARNING",
+             "problem": "null check missing on user input"},
+            {"file": "a.py", "category": "bug", "severity": "WARNING",
+             "problem": "null check missing on user input"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 1
+
+    def test_keeps_highest_severity(self):
+        findings = [
+            {"file": "a.py", "category": "security", "severity": "WARNING",
+             "problem": "SQL injection in query builder"},
+            {"file": "a.py", "category": "security", "severity": "CRITICAL",
+             "problem": "SQL injection in query builder"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 1
+        assert result[0]["severity"] == "CRITICAL"
+
+    def test_different_files_not_deduped(self):
+        findings = [
+            {"file": "a.py", "category": "bug", "severity": "WARNING",
+             "problem": "same problem description here"},
+            {"file": "b.py", "category": "bug", "severity": "WARNING",
+             "problem": "same problem description here"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 2
+
+    def test_different_categories_not_deduped(self):
+        findings = [
+            {"file": "a.py", "category": "bug", "severity": "WARNING",
+             "problem": "issue with error handling"},
+            {"file": "a.py", "category": "architecture", "severity": "WARNING",
+             "problem": "issue with error handling"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 2
+
+    def test_empty_input(self):
+        assert deduplicate_findings([]) == []
+
+    def test_near_duplicate_problems_deduped(self):
+        # First 60 chars identical, differ only after that
+        base = "Null pointer dereference when calling user.get_profile() on"
+        findings = [
+            {"file": "a.py", "category": "bug", "severity": "WARNING",
+             "problem": base + " line 42 in the main handler"},
+            {"file": "a.py", "category": "bug", "severity": "INFO",
+             "problem": base + " line 99 in the background worker"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 1
+        assert result[0]["severity"] == "WARNING"

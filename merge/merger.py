@@ -1,5 +1,5 @@
 # ABOUTME: Merge round-1 findings with round-2 verdicts, Semgrep, and SonarQube output
-# ABOUTME: Emits a final markdown report plus a JSON artifact for programmatic use
+# ABOUTME: Deduplicates cross-chunk findings and emits a final markdown report + JSON
 
 from __future__ import annotations
 
@@ -142,6 +142,37 @@ def _render_finding(f: dict, source_override: str | None = None) -> list[str]:
 
     out.append("")
     return out
+
+
+# ---------- Cross-chunk deduplication ----------
+
+def deduplicate_findings(findings: list[dict]) -> list[dict]:
+    """Deduplicate findings across chunks by (file, category, problem_key).
+
+    When multiple chunks flag the same issue on the same file, keep the one
+    with the highest severity. Uses the first 60 chars of the problem as a
+    dedup key (catches near-identical descriptions from different chunks).
+    """
+    _SEV_RANK = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+
+    seen: dict[tuple, dict] = {}
+    for f in findings:
+        key = (
+            f.get("file", ""),
+            f.get("category", ""),
+            f.get("problem", "")[:60].lower().strip(),
+        )
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = f
+        else:
+            # Keep highest severity
+            old_rank = _SEV_RANK.get(existing.get("severity", "INFO"), 2)
+            new_rank = _SEV_RANK.get(f.get("severity", "INFO"), 2)
+            if new_rank < old_rank:
+                seen[key] = f
+
+    return list(seen.values())
 
 
 # ---------- Merge pipeline ----------

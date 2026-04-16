@@ -1,5 +1,5 @@
 # ABOUTME: End-to-end orchestrator for claude-advanced-review
-# ABOUTME: Glue: preflight -> diff -> round1 -> validate -> test-run -> semgrep -> sonarqube -> round2 -> merge
+# ABOUTME: Glue: preflight -> diff/collect -> round1 -> validate -> SAST -> round2 -> merge (diff + repo modes)
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from runner import test_runner as TR  # noqa: E402
 from runner import semgrep_runner as SR  # noqa: E402
 from runner import sonarqube_runner as SQ  # noqa: E402
 from runner import preflight_runner as PF  # noqa: E402
+from runner import repo_collector as RC  # noqa: E402
 from merge import merger as MG  # noqa: E402
 
 
@@ -356,8 +357,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                       const="all", help="Review all uncommitted changes")
     mode.add_argument("--branch", dest="base", metavar="BASE",
                       help="Review current branch vs BASE (default main)")
+    mode.add_argument("--repo", nargs="?", const=".", metavar="PATH",
+                      help="Full-repo review (optionally scoped to PATH)")
     parser.add_argument("--prompt", default="default",
-                        choices=("default", "ci-style"))
+                        choices=("default", "ci-style", "repo-review"))
     parser.add_argument("--no-preflight", action="store_true")
     parser.add_argument("--no-semgrep", action="store_true")
     parser.add_argument("--no-sonarqube", action="store_true")
@@ -373,8 +376,177 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def pipeline_repo(args: argparse.Namespace) -> int:
+    """Full-repository review: collect files, chunk, LLM per chunk, SAST, merge."""
+    project_root = Path(args.project_root).resolve()
+    repo_path = (project_root / args.repo).resolve() if args.repo != "." else project_root
+
+    if not (project_root / ".git").exists():
+        print(f"not a git repo: {project_root}", file=sys.stderr)
+        return 2
+
+    # 0) Pre-flight
+    if not args.no_preflight:
+        if PF.detect_check_target(project_root):
+            print("preflight: running make check...", file=sys.stderr)
+            pf = PF.run_preflight(project_root)
+            if not pf.passed:
+                print("preflight: FAILED. Fix before review.\n",
+                      file=sys.stderr)
+                print(pf.output, file=sys.stderr)
+                return 3
+            print("preflight: passed", file=sys.stderr)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="advanced-review-repo-"))
+    print(f"work_dir: {work_dir}", file=sys.stderr)
+
+    # 1) Collect files and generate skeleton
+    print("repo: collecting files...", file=sys.stderr)
+    files = RC.collect_files(repo_path)
+    if not files:
+        print(f"repo: no reviewable files found in {repo_path}",
+              file=sys.stderr)
+        return 1
+    print(f"repo: {len(files)} files collected", file=sys.stderr)
+
+    skeleton = RC.generate_skeleton(files)
+    (work_dir / "skeleton.txt").write_text(skeleton)
+
+    # 2) Chunk by directory
+    chunks = RC.chunk_by_directory(files)
+    print(f"repo: {len(chunks)} chunks", file=sys.stderr)
+
+    # 3) LLM review per chunk
+    prompt_path = REPO_ROOT / "prompts" / "repo-review.md"
+    prompt_template = prompt_path.read_text()
+    cwe = V.CWEStore()
+    all_findings: list[dict] = []
+
+    for i, chunk_files in enumerate(chunks):
+        chunk_label = f"chunk {i+1}/{len(chunks)}"
+        print(f"repo: reviewing {chunk_label}...", file=sys.stderr)
+
+        # Build file contents for this chunk
+        file_contents: list[str] = []
+        for f in chunk_files:
+            try:
+                rel = f.relative_to(project_root)
+            except ValueError:
+                rel = f.name
+            try:
+                content = f.read_text(errors="replace")
+            except OSError:
+                continue
+            file_contents.append(f"### {rel}\n```\n{content}\n```")
+
+        files_block = "\n\n".join(file_contents)
+        prompt_text = prompt_template.replace("{{SKELETON}}", skeleton)
+        prompt_text = prompt_text.replace("{{FILES}}", files_block)
+
+        prompt_file = work_dir / f"chunk_{i}_prompt.md"
+        prompt_file.write_text(prompt_text)
+
+        # Run reviewers
+        raw_claude, raw_gemini = run_reviewers_parallel(prompt_file,
+                                                         project_root)
+        (work_dir / f"chunk_{i}_claude.txt").write_text(raw_claude)
+        (work_dir / f"chunk_{i}_gemini.txt").write_text(raw_gemini)
+
+        claude_out = extract_json(raw_claude) or {"findings": []}
+        gemini_out = extract_json(raw_gemini) or {"findings": []}
+
+        chunk_findings: list[dict] = []
+        for f in claude_out.get("findings", []):
+            f.setdefault("id", f"c-{i}-{len(chunk_findings)+1}")
+            f["source"] = "claude"
+            chunk_findings.append(f)
+        for f in gemini_out.get("findings", []):
+            f.setdefault("id", f"g-{i}-{len(chunk_findings)+1}")
+            f["source"] = "gemini"
+            chunk_findings.append(f)
+
+        # Validate (repo mode: check file/line existence, no diff)
+        validated = [V.validate_finding_repo(f, project_root, cwe)
+                     for f in chunk_findings]
+        passed = [f for f in validated if f["validator_status"] == "passed"]
+        dropped = len(validated) - len(passed)
+        print(f"  {chunk_label}: {len(passed)} passed, {dropped} dropped",
+              file=sys.stderr)
+        all_findings.extend(passed)
+
+    # 4) Deduplicate cross-chunk
+    before_dedup = len(all_findings)
+    all_findings = MG.deduplicate_findings(all_findings)
+    print(f"repo: dedup {before_dedup} -> {len(all_findings)}",
+          file=sys.stderr)
+
+    # 5) Semgrep
+    semgrep_findings: list[dict] = []
+    if not args.no_semgrep:
+        print("semgrep: running...", file=sys.stderr)
+        raw = SR.run_semgrep(project_root)
+        semgrep_findings = SR.parse_output(raw)
+        print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
+
+    # 5b) SonarQube
+    sonar_findings: list[dict] = []
+    if not args.no_sonarqube:
+        print("sonarqube: running...", file=sys.stderr)
+        sonar_findings = SQ.run_sonarqube(project_root)
+        print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+
+    # 6) Cross-check on CRITICAL/WARNING
+    cw_findings = [f for f in all_findings
+                   if f.get("severity") in ("CRITICAL", "WARNING")]
+    claude_verdicts: dict[str, dict] = {}
+    gemini_verdicts: dict[str, dict] = {}
+
+    if cw_findings and not args.no_cross_check:
+        cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
+        # Build a pseudo-diff context from file contents for cross-check
+        cross_files = {f.get("file", "") for f in cw_findings}
+        file_ctx = []
+        for fp in cross_files:
+            full = project_root / fp
+            if full.is_file():
+                try:
+                    file_ctx.append(f"### {fp}\n```\n{full.read_text(errors='replace')}\n```")
+                except OSError:
+                    pass
+        file_context = "\n\n".join(file_ctx)
+        cross_prompt = build_prompt(cross_prompt_path, file_context,
+                                    findings=cw_findings)
+        (work_dir / "cross_check_prompt.md").write_text(cross_prompt)
+        print(f"round 2: cross-check on {len(cw_findings)} findings...",
+              file=sys.stderr)
+        raw_c2_claude, raw_c2_gemini = run_reviewers_parallel(
+            work_dir / "cross_check_prompt.md", project_root,
+        )
+        vc = extract_json(raw_c2_claude).get("verdicts", [])
+        vg = extract_json(raw_c2_gemini).get("verdicts", [])
+        claude_verdicts = {v["finding_id"]: v for v in vc if v.get("finding_id")}
+        gemini_verdicts = {v["finding_id"]: v for v in vg if v.get("finding_id")}
+
+    # 7) Merge
+    annotated = MG.annotate_with_verdicts(all_findings, claude_verdicts,
+                                          gemini_verdicts)
+    report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings,
+                                sonar_findings=sonar_findings)
+    out_md = work_dir / "report.md"
+    out_json = work_dir / "report.json"
+    out_md.write_text(report_md)
+    out_json.write_text(json.dumps(
+        {"findings": annotated + semgrep_findings + sonar_findings}, indent=2))
+
+    print(f"\nReport: {out_md}")
+    print(f"JSON:   {out_json}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
+    if args.repo is not None:
+        return pipeline_repo(args)
     return pipeline(args)
 
 
