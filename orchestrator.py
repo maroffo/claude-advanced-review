@@ -1,5 +1,5 @@
 # ABOUTME: End-to-end orchestrator for claude-advanced-review
-# ABOUTME: Glue: diff -> round1 -> validate -> test-run -> semgrep -> round2 -> merge -> report
+# ABOUTME: Glue: diff -> round1 -> validate -> test-run -> semgrep -> sonarqube -> round2 -> merge -> report
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from validator import validator as V  # noqa: E402
 from runner import test_runner as TR  # noqa: E402
 from runner import semgrep_runner as SR  # noqa: E402
+from runner import sonarqube_runner as SQ  # noqa: E402
 from merge import merger as MG  # noqa: E402
 
 
@@ -255,9 +256,22 @@ def pipeline(args: argparse.Namespace) -> int:
             json.dumps({"findings": semgrep_findings}, indent=2))
         print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
 
+    # 5b) SonarQube (ground truth, persistent container)
+    sonar_findings: list[dict] = []
+    if not args.no_sonarqube:
+        print("sonarqube: running...", file=sys.stderr)
+        sonar_findings = SQ.run_sonarqube(project_root)
+        (work_dir / "sonarqube.json").write_text(
+            json.dumps({"findings": sonar_findings}, indent=2))
+        print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+
     # 6) Cross-check round 2
+    # Include CRITICAL/WARNING from LLM surviving + SonarQube ground truth
+    sonar_cw = [f for f in sonar_findings
+                if f.get("severity") in ("CRITICAL", "WARNING")]
     cw_findings = [f for f in surviving
                    if f.get("severity") in ("CRITICAL", "WARNING")]
+    cw_findings.extend(sonar_cw)
     claude_verdicts: dict[str, dict] = {}
     gemini_verdicts: dict[str, dict] = {}
 
@@ -290,12 +304,20 @@ def pipeline(args: argparse.Namespace) -> int:
     # 7) Merge
     annotated = MG.annotate_with_verdicts(surviving, claude_verdicts,
                                           gemini_verdicts)
-    report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings)
+    # SonarQube CRITICAL/WARNING that went through cross-check get verdicts too
+    sonar_annotated = MG.annotate_with_verdicts(sonar_cw, claude_verdicts,
+                                                gemini_verdicts)
+    sonar_info = [f for f in sonar_findings
+                  if f.get("severity") not in ("CRITICAL", "WARNING")]
+    all_sonar = sonar_annotated + sonar_info
+
+    report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings,
+                                sonar_findings=all_sonar)
     out_md = work_dir / "report.md"
     out_json = work_dir / "report.json"
     out_md.write_text(report_md)
     out_json.write_text(json.dumps(
-        {"findings": annotated + semgrep_findings}, indent=2))
+        {"findings": annotated + semgrep_findings + all_sonar}, indent=2))
 
     print(f"\nReport: {out_md}")
     print(f"JSON:   {out_json}")
@@ -320,6 +342,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--prompt", default="default",
                         choices=("default", "ci-style"))
     parser.add_argument("--no-semgrep", action="store_true")
+    parser.add_argument("--no-sonarqube", action="store_true")
     parser.add_argument("--no-cross-check", action="store_true")
     parser.add_argument("--no-test-runner", action="store_true")
     args = parser.parse_args(argv)

@@ -1,9 +1,9 @@
-# ABOUTME: Unit tests for merge.classify_confidence — the round-2 decision matrix
+# ABOUTME: Unit tests for merge.classify_confidence and build_report
 # ABOUTME: Both ACCEPT = HIGH_CONFIDENCE, any genuine REJECT/REFUTE = DISPUTED
 
 from __future__ import annotations
 
-from merge.merger import classify_confidence
+from merge.merger import classify_confidence, build_report
 
 
 def _accept(finding_id: str = "f1") -> dict:
@@ -73,3 +73,35 @@ class TestClassifyConfidence:
 
     def test_missing_both_verdicts_is_unverified(self):
         assert classify_confidence(None, None) == "UNVERIFIED"
+
+
+class TestBuildReport:
+    def test_includes_sonarqube_section(self):
+        sonar = [{"severity": "WARNING", "file": "x.go", "line": 10,
+                  "problem": "duplicated literal", "category": "quality",
+                  "source": "sonarqube", "evidence": {"rule_id": "go:S1192"}}]
+        report = build_report([], sonar_findings=sonar)
+        assert "## SonarQube (ground truth)" in report
+        assert "duplicated literal" in report
+
+    def test_includes_semgrep_and_sonarqube_sections(self):
+        semgrep = [{"severity": "CRITICAL", "file": "a.py", "line": 1,
+                    "problem": "sqli", "category": "security",
+                    "source": "semgrep", "evidence": {"cwe_id": "CWE-89"}}]
+        sonar = [{"severity": "WARNING", "file": "b.go", "line": 5,
+                  "problem": "smell", "category": "quality",
+                  "source": "sonarqube", "evidence": {"rule_id": "go:S1"}}]
+        report = build_report([], semgrep_findings=semgrep, sonar_findings=sonar)
+        assert "## Semgrep (ground truth)" in report
+        assert "## SonarQube (ground truth)" in report
+
+    def test_summary_includes_sonarqube_count(self):
+        sonar = [{"severity": "INFO", "file": "x.go", "line": 1,
+                  "problem": "unused", "category": "quality",
+                  "source": "sonarqube", "evidence": {}}]
+        report = build_report([], sonar_findings=sonar)
+        assert "1 from SonarQube" in report
+
+    def test_no_sonarqube_section_when_empty(self):
+        report = build_report([], sonar_findings=[])
+        assert "## SonarQube (ground truth)" not in report
