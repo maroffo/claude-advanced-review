@@ -28,6 +28,7 @@ or `/advanced-review`.
 | `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
 | `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
 | `--no-sonarqube` | Skip the SonarQube reviewer | off (SonarQube runs) |
+| `--no-preflight` | Skip the pre-flight make check gate | off (preflight runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
 
 ## Execution Flow
@@ -35,6 +36,20 @@ or `/advanced-review`.
 The orchestrator script at `orchestrator.sh` runs these steps in order. Each
 step feeds the next; any step producing zero findings short-circuits the rest
 cleanly.
+
+### Step 0 — Pre-flight gate (make check)
+
+If the project has a `make check` target, the orchestrator runs it before
+anything else. If it fails, the pipeline stops immediately with the raw
+output. No diff, no LLM calls, no money spent on broken code.
+
+Detection uses `make -n check` (dry-run): exit 0 or 1 means the target
+exists, exit 2 means it doesn't.
+
+If no `make check` target is found, the step is skipped with a suggestion:
+"Run `/project-checks` to scaffold one."
+
+Skip with `--no-preflight`.
 
 ### Step 1 — Generate the diff
 
