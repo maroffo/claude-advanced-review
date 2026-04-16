@@ -1,4 +1,4 @@
-# ABOUTME: Merge round-1 findings with round-2 verdicts and Semgrep output
+# ABOUTME: Merge round-1 findings with round-2 verdicts, Semgrep, and SonarQube output
 # ABOUTME: Emits a final markdown report plus a JSON artifact for programmatic use
 
 from __future__ import annotations
@@ -64,7 +64,9 @@ def _finding_sort_key(f: dict) -> tuple:
     )
 
 
-def build_report(findings: list[dict], semgrep_findings: list[dict] | None = None) -> str:
+def build_report(findings: list[dict],
+                 semgrep_findings: list[dict] | None = None,
+                 sonar_findings: list[dict] | None = None) -> str:
     findings = sorted(findings, key=_finding_sort_key)
     out: list[str] = ["# Advanced Review Report", ""]
 
@@ -72,10 +74,12 @@ def build_report(findings: list[dict], semgrep_findings: list[dict] | None = Non
     total_warning = sum(1 for f in findings if f.get("severity") == "WARNING")
     total_info = sum(1 for f in findings if f.get("severity") == "INFO")
     total_semgrep = len(semgrep_findings or [])
+    total_sonar = len(sonar_findings or [])
 
     out.append(
         f"**Summary:** {total_critical} CRITICAL, {total_warning} WARNING, "
-        f"{total_info} INFO from LLM reviewers; {total_semgrep} from Semgrep."
+        f"{total_info} INFO from LLM reviewers; {total_semgrep} from Semgrep; "
+        f"{total_sonar} from SonarQube."
     )
     out.append("")
 
@@ -93,6 +97,12 @@ def build_report(findings: list[dict], semgrep_findings: list[dict] | None = Non
         out.append("")
         for f in sorted(semgrep_findings, key=_finding_sort_key):
             out.extend(_render_finding(f, source_override="semgrep"))
+
+    if sonar_findings:
+        out.append("## SonarQube (ground truth)")
+        out.append("")
+        for f in sorted(sonar_findings, key=_finding_sort_key):
+            out.extend(_render_finding(f, source_override="sonarqube"))
 
     return "\n".join(out)
 
@@ -168,6 +178,7 @@ def _main() -> int:
     parser.add_argument("--claude-verdicts", type=Path)
     parser.add_argument("--gemini-verdicts", type=Path)
     parser.add_argument("--semgrep", type=Path)
+    parser.add_argument("--sonarqube", type=Path)
     parser.add_argument("--out-md", type=Path, required=True)
     parser.add_argument("--out-json", type=Path, required=True)
     args = parser.parse_args()
@@ -186,14 +197,19 @@ def _main() -> int:
     semgrep = []
     if args.semgrep and args.semgrep.exists():
         semgrep = json.loads(args.semgrep.read_text()).get("findings", [])
+    sonar = []
+    if args.sonarqube and args.sonarqube.exists():
+        sonar = json.loads(args.sonarqube.read_text()).get("findings", [])
 
     annotated = annotate_with_verdicts(findings, claude_verdicts, gemini_verdicts)
-    merged_all = annotated + semgrep  # semgrep findings surface directly
+    merged_all = annotated + semgrep + sonar
 
-    args.out_md.write_text(build_report(annotated, semgrep_findings=semgrep))
+    args.out_md.write_text(build_report(annotated, semgrep_findings=semgrep,
+                                        sonar_findings=sonar))
     args.out_json.write_text(json.dumps({"findings": merged_all}, indent=2))
-    print(f"merge: {len(annotated)} LLM findings, {len(semgrep)} semgrep -> "
-          f"{args.out_md}, {args.out_json}", file=sys.stderr)
+    print(f"merge: {len(annotated)} LLM, {len(semgrep)} semgrep, "
+          f"{len(sonar)} sonarqube -> {args.out_md}, {args.out_json}",
+          file=sys.stderr)
     return 0
 
 

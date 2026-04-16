@@ -1,18 +1,18 @@
 ---
 name: advanced-review
-description: "Thorough code review with verifiable claims. Dual isolated reviewers (Claude + Gemini in Docker), deterministic validator, Semgrep as third reviewer, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, semgrep/semgrep:latest images available; Python 3.10+ on host for the validator."
+description: "Thorough code review with verifiable claims. Dual isolated reviewers (Claude + Gemini in Docker), deterministic validator, Semgrep and SonarQube as ground-truth reviewers, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, semgrep/semgrep:latest, sonarqube:community, sonarsource/sonar-scanner-cli images available; Python 3.10+ on host for the validator."
 ---
 
-# ABOUTME: Advanced code review with verifiable claims and hostile cross-check
+# ABOUTME: Advanced code review with verifiable claims, SAST ground truth, and hostile cross-check
 # ABOUTME: Kills hallucinations before they reach the human reviewer
 
 # Advanced Review (Verifiable Claims Edition)
 
 Two LLM reviewers run in isolated Docker containers, a deterministic validator
-filters unprovable claims, Semgrep provides a zero-hallucination ground truth,
-and a hostile cross-check round tries to demolish what survives. Humans only
-see findings that cleared every gate.
+filters unprovable claims, Semgrep and SonarQube provide zero-hallucination
+ground truth, and a hostile cross-check round tries to demolish what survives.
+Humans only see findings that cleared every gate.
 
 ## Trigger
 
@@ -27,6 +27,7 @@ or `/advanced-review`.
 | `--branch [base]` | Review current branch vs base | `main` |
 | `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
 | `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
+| `--no-sonarqube` | Skip the SonarQube reviewer | off (SonarQube runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
 
 ## Execution Flow
@@ -142,6 +143,48 @@ Semgrep's role:
 
 Skip with `--no-semgrep`.
 
+### Step 5b — SonarQube (ground truth, persistent container)
+
+`runner/sonarqube_runner.py` manages a persistent `sonarqube-review` Docker
+container running SonarQube Community Build. The container starts on first use
+(~60-120s cold start) and stays running for subsequent reviews (~10-30s per
+scan).
+
+**Flow:**
+
+1. `ensure_running()`: check/start the `sonarqube-review` container, wait for
+   health check (`/api/system/status`).
+2. `generate_project_key()`: unique key from `{repo}_{branch}_{short_sha}` to
+   isolate scans across branches/projects.
+3. `run_scan()`: `sonarsource/sonar-scanner-cli` via Docker with
+   `-Dsonar.qualitygate.wait=true` (blocks until analysis completes) and
+   `-Dsonar.working.dir=/tmp/.scannerwork-<uuid>` (no repo pollution).
+4. `fetch_issues()`: `GET /api/issues/search` with pagination.
+5. `cleanup_old_projects()`: best-effort deletion of project keys >24h old.
+
+**Mapping:**
+
+| SonarQube severity | Pipeline severity |
+|--------------------|-------------------|
+| BLOCKER | CRITICAL |
+| CRITICAL | CRITICAL |
+| MAJOR | WARNING |
+| MINOR | INFO |
+| INFO | INFO |
+
+| SonarQube type | Pipeline category |
+|----------------|-------------------|
+| BUG | bug |
+| VULNERABILITY | security |
+| CODE_SMELL | quality |
+| SECURITY_HOTSPOT | security |
+
+SonarQube findings are tagged `source: "sonarqube"` and are **ground truth**
+(bypass the validator). CRITICAL/WARNING findings enter the cross-check round 2
+where LLMs can dispute contextual relevance but not structural existence.
+
+Skip with `--no-sonarqube`.
+
 ### Step 6 — Round 2 cross-check (hostile defense)
 
 Only `CRITICAL` and `WARNING` findings enter round 2. Each LLM reviewer
@@ -171,6 +214,8 @@ as round 1, different prompt).
 | flagged | any REFUTE-BY-EXPLANATION (validated) | `DISPUTED`, human decides |
 | flagged | REFUTE with invalid citation | Original claim wins (REFUTE discarded) |
 | (semgrep only) | n/a | `GROUND_TRUTH`, added directly |
+| (sonarqube, CRITICAL/WARNING) | cross-checked | confidence tag from verdicts |
+| (sonarqube, INFO) | n/a | `GROUND_TRUTH`, added directly |
 
 The final report is markdown with sections by severity, each finding showing:
 - Source reviewer(s) and verdict chain
@@ -204,6 +249,12 @@ The final report is markdown with sections by severity, each finding showing:
 | `claude-reviewer` image missing | Build: `cd claude-forge/docker/isolated-reviewer && docker build -t claude-reviewer:latest .` |
 | `gemini-reviewer` image missing | Build: `cd claude-forge/docker/isolated-gemini && docker build -t gemini-reviewer:latest .` |
 | `semgrep/semgrep` image missing | `docker pull semgrep/semgrep:latest` |
+| `sonarqube:community` image missing | `docker pull sonarqube:community` |
+| `sonarsource/sonar-scanner-cli` image missing | `docker pull sonarsource/sonar-scanner-cli` |
+| SonarQube slow first run | Normal: ~60-120s cold start. Container stays running for subsequent reviews |
+| SonarQube container stopped | Runner auto-restarts it. Or: `docker start sonarqube-review` |
+| SonarQube port 9000 conflict | Stop conflicting service or change port in `sonarqube_runner.py` |
+| SonarQube token expired | Delete `~/.cache/claude-advanced-review/sonar-token` and rerun |
 | Claude auth fails | Re-login: `docker run -it --rm -v claude-reviewer-auth:/home/node/.claude --entrypoint bash claude-reviewer:latest -c "claude login"` |
 | Gemini API errors | Check `~/.config/gemini-api-key` exists and is valid |
 | Validator: "CWE list not found" | Delete `~/.cache/claude-advanced-review/cwe.json` and rerun (forces refresh) |

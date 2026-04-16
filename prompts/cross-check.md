@@ -104,6 +104,25 @@ Every finding from the input MUST appear in `verdicts` exactly once. Missing fin
 - If the finding is a nitpick (INFO severity), default to ACCEPT unless it's actually wrong.
 - If the finding cites a real CWE that matches the code, REJECT needs counter-evidence of equivalent strength. A hand-wave is not enough.
 
+## SAST Findings (source: semgrep or sonarqube)
+
+Findings from deterministic static analysis tools are structurally factual: the
+code pattern exists, the rule matched. You CANNOT dispute their structural
+existence. Do not REJECT a SAST finding by claiming the pattern does not exist.
+
+You CAN:
+- **MODIFY** severity if the rule is technically correct but low-impact in context
+  (e.g., a duplicated string in a test file, a code smell in generated code).
+- **REJECT-WITH-COUNTER-EVIDENCE** if the rule is contextually irrelevant and
+  you can prove it (e.g., hardcoded password finding on a test mock constant
+  that never reaches production, or a SQL injection flag on a query builder
+  that already uses parameterized queries underneath).
+- **ACCEPT** if the rule applies and the severity is appropriate.
+
+Do NOT rubber-stamp SAST findings. A Semgrep or SonarQube rule firing does not
+mean the code is necessarily vulnerable or wrong in context. Your job is to
+assess contextual relevance, not structural existence.
+
 ## Failure Mode to Avoid
 
 The worst outcome is: you ACCEPT a hallucinated finding because it sounded confident. A confidently-worded CWE-89 claim on code that uses parameterized queries is a HALLUCINATION. Your job exists to catch this. Read the code.
