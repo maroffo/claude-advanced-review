@@ -305,6 +305,74 @@ class TestValidateFinding:
         assert result["severity"] == "INFO"
 
 
+class TestValidateFindingRepo:
+    def test_passes_when_file_and_line_exist(self, cwe_store, tmp_path, monkeypatch):
+        src = tmp_path / "app.py"
+        src.write_text("line1\nline2\nline3\n")
+        resp = MagicMock(status_code=200)
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
+        finding = {
+            "id": "r1", "category": "security", "severity": "CRITICAL",
+            "file": "app.py", "line": 2, "problem": "x", "suggestion": "y",
+            "evidence": {"cwe_id": "CWE-89",
+                         "cwe_url": "https://cwe.mitre.org/data/definitions/89.html"},
+        }
+        result = V.validate_finding_repo(finding, tmp_path, cwe_store)
+        assert result["validator_status"] == "passed"
+
+    def test_drops_when_file_missing(self, cwe_store, tmp_path, monkeypatch):
+        resp = MagicMock(status_code=200)
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
+        finding = {
+            "id": "r2", "category": "security", "severity": "CRITICAL",
+            "file": "nonexistent.py", "line": 1, "problem": "x", "suggestion": "y",
+            "evidence": {"cwe_id": "CWE-89",
+                         "cwe_url": "https://cwe.mitre.org/data/definitions/89.html"},
+        }
+        result = V.validate_finding_repo(finding, tmp_path, cwe_store)
+        assert result["validator_status"] == "dropped"
+        assert any("file/line" in r for r in result["validator_reasons"])
+
+    def test_drops_when_line_exceeds_file(self, cwe_store, tmp_path, monkeypatch):
+        src = tmp_path / "short.py"
+        src.write_text("one\ntwo\n")
+        resp = MagicMock(status_code=200)
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
+        finding = {
+            "id": "r3", "category": "security", "severity": "CRITICAL",
+            "file": "short.py", "line": 999, "problem": "x", "suggestion": "y",
+            "evidence": {"cwe_id": "CWE-89",
+                         "cwe_url": "https://cwe.mitre.org/data/definitions/89.html"},
+        }
+        result = V.validate_finding_repo(finding, tmp_path, cwe_store)
+        assert result["validator_status"] == "dropped"
+
+    def test_bug_skips_diff_relevance(self, cwe_store, tmp_path):
+        src = tmp_path / "app.py"
+        src.write_text("def foo():\n    pass\n")
+        finding = {
+            "id": "r4", "category": "bug", "severity": "WARNING",
+            "file": "app.py", "line": 1, "problem": "x", "suggestion": "y",
+            "evidence": {
+                "test_language": "python",
+                "test_target_file": "tests/test_app.py",
+                "test": "def test_foo():\n    assert foo() is None\n",
+            },
+        }
+        # In repo mode, no diff relevance check, just syntax
+        result = V.validate_finding_repo(finding, tmp_path, cwe_store)
+        assert result["validator_status"] == "passed"
+
+    def test_nitpick_autodemotes(self, cwe_store, tmp_path):
+        finding = {
+            "id": "r5", "category": "nitpick", "severity": "WARNING",
+            "file": "x.py", "line": 1, "problem": "style", "suggestion": "fix",
+            "evidence": {},
+        }
+        result = V.validate_finding_repo(finding, tmp_path, cwe_store)
+        assert result["severity"] == "INFO"
+
+
 class TestValidateCrossCheck:
     def test_accept_unchanged(self, parsed_diff):
         verdict = {"finding_id": "f1", "verdict": "ACCEPT"}

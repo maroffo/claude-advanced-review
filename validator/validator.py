@@ -306,6 +306,73 @@ def validate_finding(finding: dict, diff: ParsedDiff, cwe_store: CWEStore) -> di
     return _pass(finding)
 
 
+def _file_has_line(file_path: str, line: int, project_root: Path) -> bool:
+    """Check that a file exists and has at least `line` lines."""
+    full = project_root / file_path
+    if not full.is_file():
+        return False
+    if line <= 0:
+        return True
+    try:
+        content = full.read_text(errors="replace")
+        return content.count("\n") + 1 >= line
+    except OSError:
+        return False
+
+
+def validate_finding_repo(finding: dict, project_root: Path,
+                          cwe_store: CWEStore) -> dict:
+    """Validate a finding in repo mode (no diff, check file/line existence)."""
+    category = finding.get("category")
+    evidence = finding.get("evidence") or {}
+    reasons: list[str] = []
+
+    if category == "nitpick":
+        return _pass(finding, severity="INFO")
+
+    required = _REQUIRED_EVIDENCE.get(category)
+    if required is None:
+        return _drop(finding, [f"unknown category: {category}"])
+
+    missing = [k for k in required if not evidence.get(k)]
+    if missing:
+        reasons.append(f"missing evidence fields: {missing}")
+
+    # Check file and line existence
+    file_path = finding.get("file", "")
+    line = finding.get("line", 0)
+    if file_path and not _file_has_line(file_path, line, project_root):
+        reasons.append(f"file/line not found: {file_path}:{line}")
+
+    if category == "security":
+        cwe_id = evidence.get("cwe_id")
+        cwe_url = evidence.get("cwe_url")
+        if cwe_id and not cwe_store.contains(cwe_id):
+            reasons.append(f"cwe unknown: {cwe_id}")
+        if cwe_url and not url_reachable(cwe_url):
+            reasons.append(f"cwe url unreachable: {cwe_url}")
+
+    elif category == "bug":
+        lang = evidence.get("test_language", "")
+        test = evidence.get("test", "")
+        if test:
+            if not test_syntax_ok(test, lang):
+                reasons.append(f"test syntax invalid for language {lang}")
+
+    elif category == "performance":
+        if not evidence.get("big_o") and not evidence.get("benchmark"):
+            reasons.append("performance requires big_o OR benchmark")
+
+    elif category == "architecture":
+        principle = evidence.get("principle", "")
+        if principle and len(principle) < 3:
+            reasons.append("architecture principle too short")
+
+    if reasons:
+        return _drop(finding, reasons)
+    return _pass(finding)
+
+
 def validate_verdict(verdict: dict, diff: ParsedDiff) -> dict:
     v = verdict.get("verdict")
     if v == "REFUTE-BY-EXPLANATION":
