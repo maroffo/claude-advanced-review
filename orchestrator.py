@@ -278,7 +278,11 @@ def pipeline(args: argparse.Namespace) -> int:
     sonar_findings: list[dict] = []
     if not args.no_sonarqube:
         print("sonarqube: running...", file=sys.stderr)
-        sonar_findings = SQ.run_sonarqube(project_root)
+        sonar_findings = SQ.run_sonarqube(
+            project_root,
+            diff_mode=args.diff_mode,
+            base_ref=args.base,
+        )
         (work_dir / "sonarqube.json").write_text(
             json.dumps({"findings": sonar_findings}, indent=2))
         print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
@@ -492,7 +496,11 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     sonar_findings: list[dict] = []
     if not args.no_sonarqube:
         print("sonarqube: running...", file=sys.stderr)
-        sonar_findings = SQ.run_sonarqube(project_root)
+        sonar_findings = SQ.run_sonarqube(
+            project_root,
+            diff_mode=args.diff_mode,
+            base_ref=args.base,
+        )
         print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
 
     # 6) Cross-check on CRITICAL/WARNING
