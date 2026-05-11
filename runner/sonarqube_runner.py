@@ -210,12 +210,135 @@ def generate_project_key(project_root: Path) -> str:
     return _SAFE_KEY_RE.sub("-", raw)
 
 
+# ---------- Diff scoping ----------
+
+def _changed_paths(project_root: Path, diff_mode: str,
+                   base_ref: str) -> list[str]:
+    """Return changed files in the diff as repo-root-relative paths.
+
+    Mirrors orchestrator.generate_diff modes:
+    - "staged"  -> `git diff --cached --name-only`
+    - "all"     -> `git diff HEAD --name-only`
+    - "branch"  -> `git diff ${base}...HEAD --name-only`
+
+    Empty list = either no diff or no recognised mode; the caller falls back
+    to a full-repo scan rather than scoping to nothing.
+    """
+    if diff_mode == "staged":
+        args = ["diff", "--cached", "--name-only"]
+    elif diff_mode == "all":
+        args = ["diff", "HEAD", "--name-only"]
+    elif diff_mode == "branch":
+        args = ["diff", f"{base_ref}...HEAD", "--name-only"]
+    else:
+        return []
+    raw = _git_cmd(project_root, *args)
+    if not raw:
+        return []
+    # `git diff --name-only` may emit deleted files; SonarQube can't scan
+    # those, so filter to paths that still exist on disk.
+    return [p for p in raw.splitlines()
+            if p and (project_root / p).exists()]
+
+
+def _find_tsconfigs(project_root: Path, sources: list[str]) -> list[str]:
+    """For each source dir, walk up to the repo root and grab the nearest
+    `tsconfig.json`. Returns repo-root-relative paths.
+
+    Why this exists: SonarJS's TypeScript analysis discovers `tsconfig.json`
+    via a project-wide filesystem walk that ignores `sonar.exclusions`. On
+    a monorepo with git worktrees (e.g., `.claude/worktrees/agent-*/`) it
+    finds dozens of stale tsconfigs and tries to load all of them, which
+    reliably crashes the JS bridge with `WebSocket connection closed
+    abnormally`. Passing `sonar.typescript.tsconfigPaths` explicitly limits
+    discovery to just the configs relevant to the changed sources.
+
+    Falls back to the root `tsconfig.json` if nothing is found higher than
+    the source dir; returns an empty list only if there is no tsconfig at
+    all (in which case we let SonarJS auto-discover, since the failure
+    mode at that point is the same with or without the override).
+    """
+    found = set()
+    repo_root = project_root.resolve()
+    for src in sources:
+        current = (project_root / src).resolve()
+        while True:
+            candidate = current / "tsconfig.json"
+            if candidate.exists():
+                found.add(str(candidate.relative_to(repo_root)))
+                break
+            if current == repo_root:
+                break
+            current = current.parent
+    return sorted(found)
+
+
+def _minimal_covering_dirs(paths: list[str]) -> list[str]:
+    """Reduce a list of file paths to the minimal set of parent dirs.
+
+    Example:
+        ["lib/analytics-events/src/index.ts",
+         "lib/analytics-events/test/foo.test.ts"]
+        -> ["lib/analytics-events/src", "lib/analytics-events/test"]
+
+    Files at repo root (parent == "") force a full-repo scan: there is no
+    meaningful "parent dir" shorter than the repo root, and SonarQube's
+    `sonar.sources` cannot mix the root with subdirs without scanning
+    everything twice. Returning [] signals "fall back to full scan" to the
+    caller. For everything else, drop subdirs of any other listed dir: if
+    both `lib/foo` and `lib/foo/test` are present, `lib/foo` suffices.
+    """
+    if not paths:
+        return []
+    dirs = set()
+    for p in paths:
+        parent = str(Path(p).parent)
+        if parent in ("", "."):
+            # Any root-level change collapses scoping back to the full repo.
+            return []
+        dirs.add(parent)
+    sorted_dirs = sorted(dirs, key=len)
+    minimal: list[str] = []
+    for d in sorted_dirs:
+        if not any(d == m or d.startswith(m + "/") for m in minimal):
+            minimal.append(d)
+    return minimal
+
+
 # ---------- Scanner ----------
 
 def run_scan(project_root: Path, project_key: str, token: str,
-             sonar_url: str = SONAR_URL, timeout: int = 300) -> bool:
-    """Run sonar-scanner-cli against the project. Returns True on success."""
+             sonar_url: str = SONAR_URL, timeout: int = 1800,
+             sources: list[str] | None = None) -> bool:
+    """Run sonar-scanner-cli against the project. Returns True on success.
+
+    Default timeout is 1800s (30 min) to accommodate large monorepos where
+    the cold scan can comfortably exceed the previous 5-minute ceiling.
+    Pass `sources` to scope the scan to specific repo-root-relative
+    directories (e.g., the changed dirs of a PR diff) - omit for a full
+    project scan.
+    """
     scan_id = uuid.uuid4().hex[:8]
+    if sources:
+        # Translate repo-root-relative paths into mount-relative paths so
+        # SonarQube sees only the changed subtree. Comma-separated list per
+        # the scanner CLI contract.
+        scoped = ",".join(f"/usr/src/{s}" if s != "." else "/usr/src"
+                          for s in sources)
+        sources_arg = f"-Dsonar.sources={scoped}"
+    else:
+        sources_arg = "-Dsonar.sources=/usr/src"
+    # Even when `sonar.sources` is scoped, SonarJS does a project-wide
+    # tsconfig discovery for cross-file type resolution. Without these
+    # exclusions the scanner pulls in stale `.claude/worktrees/` (Agent
+    # isolation residue), every `node_modules/`, and any compiled `dist/`,
+    # which inflates the analysis 10-100x and reliably crashes the JS bridge
+    # with `WebSocket connection closed abnormally` on monorepo-scale repos.
+    exclusions_arg = (
+        "-Dsonar.exclusions="
+        "**/.claude/**,**/node_modules/**,**/dist/**,**/build/**,"
+        "**/.next/**,**/.turbo/**,**/coverage/**"
+    )
     cmd = [
         "docker", "run", "--rm",
         "--network", "host",
@@ -225,10 +348,20 @@ def run_scan(project_root: Path, project_key: str, token: str,
         SCANNER_IMAGE,
         f"-Dsonar.projectKey={project_key}",
         f"-Dsonar.projectName={project_key}",
-        "-Dsonar.sources=/usr/src",
+        sources_arg,
+        exclusions_arg,
         "-Dsonar.qualitygate.wait=true",
         f"-Dsonar.working.dir=/tmp/.scannerwork-{scan_id}",
     ]
+    # When scoped, pin the tsconfig list to the configs nearest each
+    # source dir. SonarJS ignores `sonar.exclusions` for tsconfig discovery,
+    # so without this override it still crawls into stale worktree
+    # tsconfigs. With no scope this is a no-op (auto-discovery applies).
+    if sources:
+        tsconfigs = _find_tsconfigs(project_root, sources)
+        if tsconfigs:
+            mounted = ",".join(f"/usr/src/{tc}" for tc in tsconfigs)
+            cmd.append(f"-Dsonar.typescript.tsconfigPaths={mounted}")
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
@@ -365,8 +498,17 @@ def cleanup_old_projects(token: str, sonar_url: str = SONAR_URL,
 
 # ---------- Top-level entry point ----------
 
-def run_sonarqube(project_root: Path, timeout: int = 300) -> list[dict]:
-    """Full SonarQube flow: ensure server, scan, fetch findings."""
+def run_sonarqube(project_root: Path, timeout: int = 1800,
+                  diff_mode: str | None = None,
+                  base_ref: str | None = None) -> list[dict]:
+    """Full SonarQube flow: ensure server, scan, fetch findings.
+
+    When `diff_mode` (and optionally `base_ref`) are passed, the scan is
+    scoped to the changed dirs of the diff - on a large monorepo this
+    drops scan time from O(repo) to O(diff). If no changed files are
+    found (or the mode is unrecognised) the scan falls back to the whole
+    project, matching the previous behaviour.
+    """
     if not ensure_running():
         print("sonarqube: server not available, skipping", file=sys.stderr)
         return []
@@ -378,8 +520,20 @@ def run_sonarqube(project_root: Path, timeout: int = 300) -> list[dict]:
 
     project_key = generate_project_key(project_root)
 
-    print(f"sonarqube: scanning as {project_key}...", file=sys.stderr)
-    if not run_scan(project_root, project_key, token, timeout=timeout):
+    sources: list[str] | None = None
+    if diff_mode is not None:
+        changed = _changed_paths(project_root, diff_mode,
+                                 base_ref or "main")
+        sources = _minimal_covering_dirs(changed) or None
+
+    if sources:
+        print(f"sonarqube: scanning as {project_key} "
+              f"(scoped to {len(sources)} dir(s): {', '.join(sources)})...",
+              file=sys.stderr)
+    else:
+        print(f"sonarqube: scanning as {project_key}...", file=sys.stderr)
+    if not run_scan(project_root, project_key, token, timeout=timeout,
+                    sources=sources):
         print("sonarqube: scan failed, skipping", file=sys.stderr)
         return []
 
