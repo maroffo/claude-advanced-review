@@ -68,6 +68,7 @@ def run_gemini(prompt_file: Path, project_root: Path,
         "-p", prompt_file.read_text(),
         "-m", "gemini-3.1-pro-preview",
         "--sandbox", "false",
+        "--skip-trust",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
