@@ -119,7 +119,7 @@ docker run --rm \
   -e GEMINI_API_KEY="$(cat ~/.config/gemini-api-key)" \
   -v "$PROJECT_ROOT:/workspace:ro" \
   gemini-reviewer:latest -p "$(cat "$PROMPT_FILE")" \
-  -m gemini-3.1-pro-preview --sandbox false
+  -m gemini-3.1-pro-preview --sandbox false --skip-trust
 ```
 
 ### Step 3 — Deterministic validator
