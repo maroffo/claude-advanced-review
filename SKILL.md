@@ -1,7 +1,7 @@
 ---
 name: advanced-review
-description: "Thorough code review with verifiable claims. Dual isolated reviewers (Claude + Gemini in Docker), deterministic validator, Semgrep and SonarQube as ground-truth reviewers, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, semgrep/semgrep:latest, sonarqube:community, sonarsource/sonar-scanner-cli images available; Python 3.10+ on host for the validator."
+description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep and SonarQube as ground-truth reviewers, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest, sonarqube:community, sonarsource/sonar-scanner-cli images available; API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
 ---
 
 # ABOUTME: Advanced code review with verifiable claims, SAST ground truth, and hostile cross-check
@@ -9,10 +9,13 @@ compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer
 
 # Advanced Review (Verifiable Claims Edition)
 
-Two LLM reviewers run in isolated Docker containers, a deterministic validator
-filters unprovable claims, Semgrep and SonarQube provide zero-hallucination
-ground truth, and a hostile cross-check round tries to demolish what survives.
-Humans only see findings that cleared every gate.
+Three LLM reviewers (Claude, Gemini, DeepSeek, three different labs) run in
+isolated Docker containers, a deterministic validator filters unprovable claims,
+Semgrep and SonarQube provide zero-hallucination ground truth, and a hostile
+cross-check round tries to demolish what survives. Humans only see findings that
+cleared every gate. A reviewer that fails (timeout, expired auth, rate limit)
+is reported on stderr and the pipeline degrades to the survivors rather than
+aborting.
 
 ## Trigger
 
@@ -64,8 +67,8 @@ full-repository review. Instead of generating a diff, it:
    prompt so the LLM knows what exists in other files, reducing false positives.
 3. **Chunks files by directory** (files in the same dir are grouped together).
    Chunks split at ~4000 lines to fit LLM context.
-4. **LLM reviewers run per chunk** (both Claude and Gemini, parallel per chunk,
-   sequential across chunks). Uses `prompts/repo-review.md`.
+4. **LLM reviewers run per chunk** (Claude, Gemini, and DeepSeek, parallel per
+   chunk, sequential across chunks). Uses `prompts/repo-review.md`.
 5. **Validator checks file/line existence** (no diff relevance check).
 6. **Cross-chunk deduplication** merges findings with same file + category +
    problem description, keeping the highest severity.
@@ -90,7 +93,7 @@ pass `--branch`.
 
 ### Step 2 — Round 1 reviewers (parallel)
 
-Both reviewers receive the same prompt and diff. Output is JSON following the
+All three reviewers receive the same prompt and diff. Output is JSON following the
 schema in `prompts/default.md`: each finding carries `category`, `severity`,
 `file:line`, `problem`, `suggestion`, and an `evidence` object whose required
 fields depend on the category:
@@ -104,7 +107,10 @@ fields depend on the category:
 | `architecture` | `principle` + `application` (specific to the diff) |
 | `nitpick` | none, auto-demoted to `INFO` |
 
-Launch in parallel (single message, two Bash calls):
+Launch in parallel (single message, three Bash calls). `orchestrator.py` does
+this with a thread pool, per-reviewer timeouts (Claude/Gemini 300s, DeepSeek
+600s for R1's reasoning phase), and a `reviewer status:` line on stderr; a
+non-zero exit (e.g. a `401`) is classified as a failed reviewer, not a finding:
 
 ```bash
 docker run --rm \
@@ -120,6 +126,16 @@ docker run --rm \
   -v "$PROJECT_ROOT:/workspace:ro" \
   gemini-reviewer:latest -p "$(cat "$PROMPT_FILE")" \
   -m gemini-3.1-pro-preview --sandbox false --skip-trust
+```
+
+```bash
+docker run --rm \
+  -e DEEPSEEK_API_KEY="$(cat ~/.config/deepseek-api-key)" \
+  -v "$PROJECT_ROOT:/workspace:ro" \
+  deepseek-reviewer:latest \
+  --provider deepseek --model deepseek-reasoner \
+  -p -t read --no-session \
+  "$(cat "$PROMPT_FILE")"
 ```
 
 ### Step 3 — Deterministic validator
@@ -239,18 +255,25 @@ Four verdicts:
 | `REJECT-WITH-COUNTER-EVIDENCE` | Claim is wrong, here's the hard proof | own evidence (test that passes on current code, CWE disputing the mapping, etc.) |
 | `REFUTE-BY-EXPLANATION` | Claim is wrong, here's why in prose | `file:line` citations inside the diff that contradict the claim (validated in step 3) |
 
-Launched in parallel as two fresh stateless Docker calls (same image and auth
-as round 1, different prompt).
+Launched in parallel as three fresh stateless Docker calls (same images and
+auth as round 1, different prompt).
 
 ### Step 7 — Merge
 
+Confidence is decided by **majority across the three reviewers' verdicts**,
+computed on the verdicts actually present so one failed reviewer does not drop
+everything to `UNVERIFIED` (needs at least 2 present to form a majority):
+
+Rows are evaluated top-down; a `DISPUTED` verdict wins over an ACCEPT majority.
+
 | Round 1 flag | Cross-check outcome | Action |
 |--------------|---------------------|--------|
-| flagged | both ACCEPT | `HIGH_CONFIDENCE`, surface prominently |
-| flagged | one ACCEPT, one MODIFY | Present both versions, note the divergence |
+| flagged | fewer than 2 verdicts present | `UNVERIFIED` |
 | flagged | any REJECT-WITH-COUNTER-EVIDENCE | `DISPUTED`, human decides |
 | flagged | any REFUTE-BY-EXPLANATION (validated) | `DISPUTED`, human decides |
 | flagged | REFUTE with invalid citation | Original claim wins (REFUTE discarded) |
+| flagged | >= 2 ACCEPT | `HIGH_CONFIDENCE`, surface prominently |
+| flagged | any MODIFY (and not >= 2 ACCEPT) | `MODIFIED`, present the correction |
 | (semgrep only) | n/a | `GROUND_TRUTH`, added directly |
 | (sonarqube, CRITICAL/WARNING) | cross-checked | confidence tag from verdicts |
 | (sonarqube, INFO) | n/a | `GROUND_TRUTH`, added directly |

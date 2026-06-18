@@ -30,7 +30,15 @@ from merge import merger as MG  # noqa: E402
 
 CLAUDE_IMAGE = "claude-reviewer:latest"
 GEMINI_IMAGE = "gemini-reviewer:latest"
+DEEPSEEK_IMAGE = "deepseek-reviewer:latest"
 GEMINI_KEY_PATH = Path.home() / ".config" / "gemini-api-key"
+DEEPSEEK_KEY_PATH = Path.home() / ".config" / "deepseek-api-key"
+
+# deepseek-reasoner (R1) can spend several minutes reasoning before answering,
+# so it gets a longer wall-clock budget than the other two reviewers.
+CLAUDE_TIMEOUT = 300
+GEMINI_TIMEOUT = 300
+DEEPSEEK_TIMEOUT = 600
 
 
 def _read_gemini_key() -> str:
@@ -39,8 +47,37 @@ def _read_gemini_key() -> str:
     return GEMINI_KEY_PATH.read_text().strip()
 
 
+def _read_deepseek_key() -> str:
+    if not DEEPSEEK_KEY_PATH.exists():
+        raise SystemExit(f"missing {DEEPSEEK_KEY_PATH}")
+    return DEEPSEEK_KEY_PATH.read_text().strip()
+
+
+def _classify_failure(name: str, proc: subprocess.CompletedProcess,
+                      secret: str | None = None) -> None:
+    """Log why a reviewer produced no usable output. A non-zero exit is a
+    failure (auth, rate limit, crash), distinct from a clean empty answer.
+    Surfaces a re-login hint on auth failure so a stale token never degrades
+    silently. `secret` (the reviewer's API key, if any) is redacted from the
+    logged tail so a CLI that echoes it on error cannot leak it."""
+    blob = f"{proc.stdout}\n{proc.stderr}"
+    low = blob.lower()
+    is_auth = ("invalid authentication" in low or "unauthorized" in low
+               or ("401" in blob and "auth" in low))
+    if is_auth:
+        print(f"{name}: FAILED (auth expired/invalid; re-login the reviewer "
+              f"volume/key)", file=sys.stderr)
+        return
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    reason = tail[-1] if tail else "no output"
+    if secret:
+        reason = reason.replace(secret, "***")
+    print(f"{name}: FAILED (exit {proc.returncode}: {reason})",
+          file=sys.stderr)
+
+
 def run_claude(prompt_file: Path, project_root: Path,
-               timeout: int = 300) -> str:
+               timeout: int = CLAUDE_TIMEOUT) -> str:
     cmd = [
         "docker", "run", "--rm",
         "-v", "claude-reviewer-auth:/home/node/.claude:ro",
@@ -51,18 +88,23 @@ def run_claude(prompt_file: Path, project_root: Path,
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout)
-        return proc.stdout
     except subprocess.TimeoutExpired:
-        print(f"claude: timeout after {timeout}s", file=sys.stderr)
+        print(f"claude: FAILED (timeout after {timeout}s)", file=sys.stderr)
         return ""
+    if proc.returncode != 0:
+        _classify_failure("claude", proc)
+        return ""
+    return proc.stdout
 
 
 def run_gemini(prompt_file: Path, project_root: Path,
-               timeout: int = 300) -> str:
+               timeout: int = GEMINI_TIMEOUT) -> str:
     key = _read_gemini_key()
+    # Pass the key by name only: Docker forwards the value from this process's
+    # environment, keeping the secret out of the container's argv (ps-visible).
     cmd = [
         "docker", "run", "--rm",
-        "-e", f"GEMINI_API_KEY={key}",
+        "-e", "GEMINI_API_KEY",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         GEMINI_IMAGE,
         "-p", prompt_file.read_text(),
@@ -72,26 +114,93 @@ def run_gemini(prompt_file: Path, project_root: Path,
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
-        # Strip known noisy lines from Gemini CLI
-        raw = proc.stdout
-        cleaned = "\n".join(
-            line for line in raw.splitlines()
-            if not line.startswith("[WARN] Skipping unreadable")
-            and not line.startswith("Warning: Could not read")
-        )
-        return cleaned
+                              timeout=timeout,
+                              env={**os.environ, "GEMINI_API_KEY": key})
     except subprocess.TimeoutExpired:
-        print(f"gemini: timeout after {timeout}s", file=sys.stderr)
+        print(f"gemini: FAILED (timeout after {timeout}s)", file=sys.stderr)
         return ""
+    if proc.returncode != 0:
+        _classify_failure("gemini", proc, secret=key)
+        return ""
+    # Strip known noisy lines from Gemini CLI
+    cleaned = "\n".join(
+        line for line in proc.stdout.splitlines()
+        if not line.startswith("[WARN] Skipping unreadable")
+        and not line.startswith("Warning: Could not read")
+    )
+    return cleaned
+
+
+def run_deepseek(prompt_file: Path, project_root: Path,
+                 timeout: int = DEEPSEEK_TIMEOUT) -> str:
+    key = _read_deepseek_key()
+    # Pass the key by name only: Docker forwards the value from this process's
+    # environment, keeping the secret out of the container's argv (ps-visible).
+    cmd = [
+        "docker", "run", "--rm",
+        "-e", "DEEPSEEK_API_KEY",
+        "-v", f"{project_root.resolve()}:/workspace:ro",
+        DEEPSEEK_IMAGE,
+        "--provider", "deepseek",
+        "--model", "deepseek-reasoner",
+        "-p", "-t", "read", "--no-session",
+        prompt_file.read_text(),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout,
+                              env={**os.environ, "DEEPSEEK_API_KEY": key})
+    except subprocess.TimeoutExpired:
+        print(f"deepseek: FAILED (timeout after {timeout}s)", file=sys.stderr)
+        return ""
+    if proc.returncode != 0:
+        _classify_failure("deepseek", proc, secret=key)
+        return ""
+    return proc.stdout
 
 
 def run_reviewers_parallel(prompt_file: Path,
-                           project_root: Path) -> tuple[str, str]:
-    with cf.ThreadPoolExecutor(max_workers=2) as pool:
+                           project_root: Path) -> tuple[str, str, str]:
+    """Run all three reviewers concurrently. A reviewer that fails (timeout,
+    auth, crash) yields an empty string and is reported on stderr; the pipeline
+    degrades to the survivors rather than aborting."""
+    with cf.ThreadPoolExecutor(max_workers=3) as pool:
         f_claude = pool.submit(run_claude, prompt_file, project_root)
         f_gemini = pool.submit(run_gemini, prompt_file, project_root)
-        return f_claude.result(), f_gemini.result()
+        f_deepseek = pool.submit(run_deepseek, prompt_file, project_root)
+        raw_claude = f_claude.result()
+        raw_gemini = f_gemini.result()
+        raw_deepseek = f_deepseek.result()
+    status = " | ".join(
+        f"{name} {'OK' if raw else 'FAILED'}"
+        for name, raw in (("claude", raw_claude), ("gemini", raw_gemini),
+                          ("deepseek", raw_deepseek))
+    )
+    print(f"reviewer status: {status}", file=sys.stderr)
+    return raw_claude, raw_gemini, raw_deepseek
+
+
+def _collect_verdicts(work_dir: Path, diff: Any | None, raw_claude: str,
+                      raw_gemini: str, raw_deepseek: str,
+                      ) -> tuple[dict[str, dict], dict[str, dict],
+                                 dict[str, dict]]:
+    """Parse round-2 verdicts for all three reviewers, persisting raw output
+    and verdicts to the work dir. Returns one finding_id -> verdict map per
+    reviewer (empty if that reviewer failed). When `diff` is provided (diff
+    mode) verdicts are validated against it; in repo mode there is no diff to
+    validate against, so `diff=None` takes the verdicts raw."""
+    results: list[dict[str, dict]] = []
+    for source, raw in (("claude", raw_claude), ("gemini", raw_gemini),
+                        ("deepseek", raw_deepseek)):
+        (work_dir / f"round2_{source}.txt").write_text(raw)
+        verdicts = extract_json(raw).get("verdicts", [])
+        if diff is not None:
+            verdicts = [V.validate_verdict(v, diff) for v in verdicts]
+        by_id = {v["finding_id"]: v for v in verdicts if v.get("finding_id")}
+        (work_dir / f"{source}_verdicts.json").write_text(
+            json.dumps({"verdicts": list(by_id.values())}, indent=2))
+        results.append(by_id)
+    return results[0], results[1], results[2]
 
 
 # ---------- JSON extraction from LLM output ----------
@@ -209,24 +318,22 @@ def pipeline(args: argparse.Namespace) -> int:
     (work_dir / "round1_prompt.md").write_text(round1_prompt)
 
     print("round 1: running reviewers...", file=sys.stderr)
-    raw_claude, raw_gemini = run_reviewers_parallel(
+    raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
         work_dir / "round1_prompt.md", project_root,
     )
     (work_dir / "round1_claude.txt").write_text(raw_claude)
     (work_dir / "round1_gemini.txt").write_text(raw_gemini)
-
-    claude_out = extract_json(raw_claude) or {"findings": []}
-    gemini_out = extract_json(raw_gemini) or {"findings": []}
+    (work_dir / "round1_deepseek.txt").write_text(raw_deepseek)
 
     findings: list[dict] = []
-    for f in claude_out.get("findings", []):
-        f.setdefault("id", f"c-{len(findings)+1}")
-        f["source"] = "claude"
-        findings.append(f)
-    for f in gemini_out.get("findings", []):
-        f.setdefault("id", f"g-{len(findings)+1}")
-        f["source"] = "gemini"
-        findings.append(f)
+    for source, raw, prefix in (("claude", raw_claude, "c"),
+                                ("gemini", raw_gemini, "g"),
+                                ("deepseek", raw_deepseek, "d")):
+        out = extract_json(raw) or {"findings": []}
+        for f in out.get("findings", []):
+            f.setdefault("id", f"{prefix}-{len(findings)+1}")
+            f["source"] = source
+            findings.append(f)
     print(f"round 1: {len(findings)} raw findings", file=sys.stderr)
 
     # 3) Validator
@@ -297,6 +404,7 @@ def pipeline(args: argparse.Namespace) -> int:
     cw_findings.extend(sonar_cw)
     claude_verdicts: dict[str, dict] = {}
     gemini_verdicts: dict[str, dict] = {}
+    deepseek_verdicts: dict[str, dict] = {}
 
     if cw_findings and not args.no_cross_check:
         cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
@@ -305,31 +413,20 @@ def pipeline(args: argparse.Namespace) -> int:
         (work_dir / "round2_prompt.md").write_text(cross_prompt)
         print(f"round 2: cross-check on {len(cw_findings)} findings...",
               file=sys.stderr)
-        raw_c2_claude, raw_c2_gemini = run_reviewers_parallel(
+        raw_c2_claude, raw_c2_gemini, raw_c2_deepseek = run_reviewers_parallel(
             work_dir / "round2_prompt.md", project_root,
         )
-        (work_dir / "round2_claude.txt").write_text(raw_c2_claude)
-        (work_dir / "round2_gemini.txt").write_text(raw_c2_gemini)
-
-        vc = extract_json(raw_c2_claude).get("verdicts", [])
-        vg = extract_json(raw_c2_gemini).get("verdicts", [])
-        vc = [V.validate_verdict(v, diff) for v in vc]
-        vg = [V.validate_verdict(v, diff) for v in vg]
-        claude_verdicts = {v["finding_id"]: v for v in vc
-                           if v.get("finding_id")}
-        gemini_verdicts = {v["finding_id"]: v for v in vg
-                           if v.get("finding_id")}
-        (work_dir / "claude_verdicts.json").write_text(
-            json.dumps({"verdicts": list(claude_verdicts.values())}, indent=2))
-        (work_dir / "gemini_verdicts.json").write_text(
-            json.dumps({"verdicts": list(gemini_verdicts.values())}, indent=2))
+        claude_verdicts, gemini_verdicts, deepseek_verdicts = (
+            _collect_verdicts(work_dir, diff, raw_c2_claude, raw_c2_gemini,
+                              raw_c2_deepseek))
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(surviving, claude_verdicts,
-                                          gemini_verdicts)
+                                          gemini_verdicts, deepseek_verdicts)
     # SonarQube CRITICAL/WARNING that went through cross-check get verdicts too
     sonar_annotated = MG.annotate_with_verdicts(sonar_cw, claude_verdicts,
-                                                gemini_verdicts)
+                                                gemini_verdicts,
+                                                deepseek_verdicts)
     sonar_info = [f for f in sonar_findings
                   if f.get("severity") not in ("CRITICAL", "WARNING")]
     all_sonar = sonar_annotated + sonar_info
@@ -452,23 +549,21 @@ def pipeline_repo(args: argparse.Namespace) -> int:
         prompt_file.write_text(prompt_text)
 
         # Run reviewers
-        raw_claude, raw_gemini = run_reviewers_parallel(prompt_file,
-                                                         project_root)
+        raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
+            prompt_file, project_root)
         (work_dir / f"chunk_{i}_claude.txt").write_text(raw_claude)
         (work_dir / f"chunk_{i}_gemini.txt").write_text(raw_gemini)
-
-        claude_out = extract_json(raw_claude) or {"findings": []}
-        gemini_out = extract_json(raw_gemini) or {"findings": []}
+        (work_dir / f"chunk_{i}_deepseek.txt").write_text(raw_deepseek)
 
         chunk_findings: list[dict] = []
-        for f in claude_out.get("findings", []):
-            f.setdefault("id", f"c-{i}-{len(chunk_findings)+1}")
-            f["source"] = "claude"
-            chunk_findings.append(f)
-        for f in gemini_out.get("findings", []):
-            f.setdefault("id", f"g-{i}-{len(chunk_findings)+1}")
-            f["source"] = "gemini"
-            chunk_findings.append(f)
+        for source, raw, prefix in (("claude", raw_claude, "c"),
+                                    ("gemini", raw_gemini, "g"),
+                                    ("deepseek", raw_deepseek, "d")):
+            out = extract_json(raw) or {"findings": []}
+            for f in out.get("findings", []):
+                f.setdefault("id", f"{prefix}-{i}-{len(chunk_findings)+1}")
+                f["source"] = source
+                chunk_findings.append(f)
 
         # Validate (repo mode: check file/line existence, no diff)
         validated = [V.validate_finding_repo(f, project_root, cwe)
@@ -509,6 +604,7 @@ def pipeline_repo(args: argparse.Namespace) -> int:
                    if f.get("severity") in ("CRITICAL", "WARNING")]
     claude_verdicts: dict[str, dict] = {}
     gemini_verdicts: dict[str, dict] = {}
+    deepseek_verdicts: dict[str, dict] = {}
 
     if cw_findings and not args.no_cross_check:
         cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
@@ -528,17 +624,16 @@ def pipeline_repo(args: argparse.Namespace) -> int:
         (work_dir / "cross_check_prompt.md").write_text(cross_prompt)
         print(f"round 2: cross-check on {len(cw_findings)} findings...",
               file=sys.stderr)
-        raw_c2_claude, raw_c2_gemini = run_reviewers_parallel(
+        raw_c2_claude, raw_c2_gemini, raw_c2_deepseek = run_reviewers_parallel(
             work_dir / "cross_check_prompt.md", project_root,
         )
-        vc = extract_json(raw_c2_claude).get("verdicts", [])
-        vg = extract_json(raw_c2_gemini).get("verdicts", [])
-        claude_verdicts = {v["finding_id"]: v for v in vc if v.get("finding_id")}
-        gemini_verdicts = {v["finding_id"]: v for v in vg if v.get("finding_id")}
+        # Repo mode has no diff, so verdicts are taken raw (diff=None).
+        claude_verdicts, gemini_verdicts, deepseek_verdicts = _collect_verdicts(
+            work_dir, None, raw_c2_claude, raw_c2_gemini, raw_c2_deepseek)
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(all_findings, claude_verdicts,
-                                          gemini_verdicts)
+                                          gemini_verdicts, deepseek_verdicts)
     report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings,
                                 sonar_findings=sonar_findings)
     out_md = work_dir / "report.md"
