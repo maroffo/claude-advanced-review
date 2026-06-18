@@ -1,5 +1,5 @@
 <!-- ABOUTME: Advanced code review skill with verifiable claims to reduce LLM hallucinations -->
-<!-- ABOUTME: Dual isolated reviewers + deterministic validator + Semgrep + hostile cross-check -->
+<!-- ABOUTME: Three isolated reviewers + deterministic validator + Semgrep + hostile cross-check -->
 
 # claude-advanced-review
 
@@ -9,9 +9,10 @@ ever sees them.
 
 ## What this solves
 
-Running two LLM reviewers in parallel catches more issues than one, but both
-still hallucinate: fake CWE ids, bugs that aren't bugs, references to lines
-that don't exist. The standard workflow makes the human the validator.
+Running three LLM reviewers in parallel (Claude, Gemini, DeepSeek, three
+different labs) catches more issues than one, but they all still hallucinate:
+fake CWE ids, bugs that aren't bugs, references to lines that don't exist. The
+standard workflow makes the human the validator.
 
 This skill shifts the burden onto the reviewers:
 
@@ -75,8 +76,8 @@ Inside Claude Code:
 ## Dependencies
 
 - Docker (for isolated reviewers and Semgrep)
-- `claude-reviewer:latest` and `gemini-reviewer:latest` images (see upstream)
-- `~/.config/gemini-api-key`
+- `claude-reviewer:latest`, `gemini-reviewer:latest`, and `deepseek-reviewer:latest` images (see upstream)
+- `~/.config/gemini-api-key` and `~/.config/deepseek-api-key`
 - Python 3.10+ (validator)
 
 ## License

@@ -117,6 +117,18 @@ GEMINI_ROUND2_RAW = """```json
 ```
 """
 
+DEEPSEEK_ROUND2_RAW = """```json
+{
+  "verdicts": [
+    {"finding_id": "c1", "verdict": "ACCEPT"},
+    {"finding_id": "c2", "verdict": "MODIFY",
+     "modification": {"severity": "CRITICAL", "rationale": "Unhandled zero divisor."}}
+  ],
+  "summary": "1 ACCEPT, 1 MODIFY."
+}
+```
+"""
+
 
 # ---------- Helpers ----------
 
@@ -205,15 +217,21 @@ class TestPipelineReplay:
             v["finding_id"]: V.validate_verdict(v, diff)
             for v in O.extract_json(GEMINI_ROUND2_RAW)["verdicts"]
         }
+        deepseek_verdicts = {
+            v["finding_id"]: V.validate_verdict(v, diff)
+            for v in O.extract_json(DEEPSEEK_ROUND2_RAW)["verdicts"]
+        }
 
         annotated = MG.annotate_with_verdicts(surviving, claude_verdicts,
-                                              gemini_verdicts)
+                                              gemini_verdicts,
+                                              deepseek_verdicts)
         by_id = {f["id"]: f for f in annotated}
 
-        # c1: both ACCEPT -> HIGH_CONFIDENCE
+        # c1: all three ACCEPT -> HIGH_CONFIDENCE
         assert by_id["c1"]["confidence"] == "HIGH_CONFIDENCE"
 
-        # c2: Claude ACCEPT + Gemini MODIFY -> MODIFIED, severity bumped to CRITICAL
+        # c2: Claude ACCEPT + Gemini/DeepSeek MODIFY -> majority MODIFY ->
+        # MODIFIED, severity bumped to CRITICAL
         assert by_id["c2"]["confidence"] == "MODIFIED"
         assert by_id["c2"]["severity"] == "CRITICAL"
 
@@ -222,6 +240,7 @@ class TestPipelineReplay:
         assert "HIGH_CONFIDENCE" in report
         assert "MODIFIED" in report
         assert "CWE-89" in report
+        assert "deepseek=" in report
 
     def test_disputed_when_refute_valid(self, tmp_path, monkeypatch):
         _preseed_cwe_cache(monkeypatch, tmp_path)
@@ -250,10 +269,13 @@ class TestPipelineReplay:
         accept = {"finding_id": "c1", "verdict": "ACCEPT"}
         cv = V.validate_verdict(refute, diff)
         gv = V.validate_verdict(accept, diff)
+        dv = V.validate_verdict(dict(accept), diff)
         assert cv["validator_status"] == "passed", cv
 
+        # Claude REFUTE (valid) + Gemini/DeepSeek ACCEPT: a disputed verdict
+        # poisons the set regardless of the majority.
         annotated = MG.annotate_with_verdicts(
-            [validated], {"c1": cv}, {"c1": gv}
+            [validated], {"c1": cv}, {"c1": gv}, {"c1": dv}
         )
         assert annotated[0]["confidence"] == "DISPUTED"
 
@@ -281,13 +303,14 @@ class TestPipelineReplay:
         accept = {"finding_id": "c1", "verdict": "ACCEPT"}
         cv = V.validate_verdict(bad_refute, diff)
         gv = V.validate_verdict(accept, diff)
+        dv = V.validate_verdict(dict(accept), diff)
         assert cv["validator_status"] == "discarded"
         assert cv["effective_verdict"] == "ACCEPT"
 
         annotated = MG.annotate_with_verdicts(
-            [validated], {"c1": cv}, {"c1": gv}
+            [validated], {"c1": cv}, {"c1": gv}, {"c1": dv}
         )
-        # REFUTE discarded -> treated as ACCEPT -> both ACCEPT -> HIGH_CONFIDENCE
+        # REFUTE discarded -> ACCEPT -> three ACCEPT -> HIGH_CONFIDENCE
         assert annotated[0]["confidence"] == "HIGH_CONFIDENCE"
 
 

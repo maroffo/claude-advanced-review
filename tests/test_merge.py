@@ -1,5 +1,5 @@
 # ABOUTME: Unit tests for merge.classify_confidence and build_report
-# ABOUTME: Both ACCEPT = HIGH_CONFIDENCE, any genuine REJECT/REFUTE = DISPUTED
+# ABOUTME: 2-of-3 majority: >= 2 ACCEPT = HIGH_CONFIDENCE, any genuine REJECT/REFUTE = DISPUTED
 
 from __future__ import annotations
 
@@ -45,34 +45,66 @@ def _refute(finding_id: str = "f1", discarded: bool = False) -> dict:
 
 
 class TestClassifyConfidence:
-    def test_both_accept_is_high_confidence(self):
-        assert classify_confidence(_accept(), _accept()) == "HIGH_CONFIDENCE"
+    """Three-reviewer (Claude + Gemini + DeepSeek) majority rubric: decided on
+    the verdicts present, needs >= 2 ACCEPT for HIGH_CONFIDENCE, tolerates one
+    missing reviewer."""
 
-    def test_accept_plus_modify_is_modified(self):
-        assert classify_confidence(_accept(), _modify()) == "MODIFIED"
-        assert classify_confidence(_modify(), _accept()) == "MODIFIED"
-
-    def test_reject_with_counter_is_disputed(self):
-        assert classify_confidence(_accept(), _reject()) == "DISPUTED"
-        assert classify_confidence(_reject(), _accept()) == "DISPUTED"
-
-    def test_refute_valid_is_disputed(self):
-        assert classify_confidence(_accept(), _refute()) == "DISPUTED"
-
-    def test_refute_discarded_falls_back_to_accept(self):
-        # Invalid citations -> REFUTE effectively ACCEPT -> HIGH_CONFIDENCE
-        assert classify_confidence(_accept(), _refute(discarded=True)) == \
+    def test_all_three_accept_is_high_confidence(self):
+        assert classify_confidence([_accept(), _accept(), _accept()]) == \
                "HIGH_CONFIDENCE"
 
-    def test_both_modify_is_modified(self):
-        assert classify_confidence(_modify(), _modify()) == "MODIFIED"
+    def test_two_accept_one_modify_is_high_confidence(self):
+        # Majority ACCEPT wins even with one dissenting MODIFY.
+        assert classify_confidence([_accept(), _accept(), _modify()]) == \
+               "HIGH_CONFIDENCE"
 
-    def test_missing_one_verdict_is_unverified(self):
-        assert classify_confidence(_accept(), None) == "UNVERIFIED"
-        assert classify_confidence(None, _accept()) == "UNVERIFIED"
+    def test_one_accept_two_modify_is_modified(self):
+        assert classify_confidence([_accept(), _modify(), _modify()]) == \
+               "MODIFIED"
 
-    def test_missing_both_verdicts_is_unverified(self):
-        assert classify_confidence(None, None) == "UNVERIFIED"
+    def test_all_modify_is_modified(self):
+        assert classify_confidence([_modify(), _modify(), _modify()]) == \
+               "MODIFIED"
+
+    def test_any_reject_with_counter_is_disputed(self):
+        assert classify_confidence([_accept(), _accept(), _reject()]) == \
+               "DISPUTED"
+
+    def test_valid_refute_is_disputed(self):
+        assert classify_confidence([_accept(), _accept(), _refute()]) == \
+               "DISPUTED"
+
+    def test_refute_discarded_falls_back_to_accept(self):
+        # Invalid citations -> REFUTE effectively ACCEPT -> 3 ACCEPT -> HIGH.
+        assert classify_confidence(
+            [_accept(), _accept(), _refute(discarded=True)]) == \
+            "HIGH_CONFIDENCE"
+
+    # --- graceful degradation: one reviewer missing (only 2 present) ---
+
+    def test_two_present_both_accept_is_high_confidence(self):
+        assert classify_confidence([_accept(), _accept(), None]) == \
+               "HIGH_CONFIDENCE"
+
+    def test_two_present_accept_plus_modify_is_modified(self):
+        # No ACCEPT majority among present, one wants changes -> MODIFIED.
+        assert classify_confidence([_accept(), _modify(), None]) == "MODIFIED"
+
+    def test_two_present_one_disputed_is_disputed(self):
+        assert classify_confidence([_accept(), _reject(), None]) == "DISPUTED"
+
+    # --- fewer than 2 present: no majority possible ---
+
+    def test_only_one_present_is_unverified(self):
+        assert classify_confidence([_accept(), None, None]) == "UNVERIFIED"
+
+    def test_lone_disputing_verdict_is_unverified_not_disputed(self):
+        # A single surviving reviewer cannot form a majority: a lone refutation
+        # is UNVERIFIED, not DISPUTED (needs corroboration).
+        assert classify_confidence([_reject(), None, None]) == "UNVERIFIED"
+
+    def test_none_present_is_unverified(self):
+        assert classify_confidence([None, None, None]) == "UNVERIFIED"
 
 
 class TestBuildReport:
