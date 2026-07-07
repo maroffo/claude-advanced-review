@@ -450,7 +450,7 @@ def _fake_reviewers(round1: tuple[str, str, str], round2: str):
     """Stub for run_reviewers_parallel: dispatch on prompt content. The
     cross-check prompt carries a '## Findings to Evaluate' section that the
     round-1 prompt does not."""
-    def stub(prompt_file, project_root):
+    def stub(prompt_file, project_root, **kwargs):
         text = Path(prompt_file).read_text()
         if "Findings to Evaluate" in text:
             return round2, round2, round2
@@ -461,6 +461,12 @@ def _fake_reviewers(round1: tuple[str, str, str], round2: str):
 class TestPipelineEndToEnd:
     """Drive the real O.pipeline / O.pipeline_repo / O.main against a temporary
     git repo, stubbing only the Docker/LLM/SAST boundaries and validator net."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_egress_guard(self, monkeypatch):
+        """The egress guard talks to real Docker; stub it so these tests
+        stay deterministic on machines without Docker."""
+        monkeypatch.setattr(O, "ensure_egress_guard", lambda: True)
 
     def _work_dir_factory(self, monkeypatch, tmp_path):
         """Redirect tempfile.mkdtemp into tmp_path and record created dirs."""
@@ -556,6 +562,30 @@ class TestPipelineEndToEnd:
                             lambda project_root, mode, base: None)
         rc = O.main(["--project-root", str(root), "--no-preflight"])
         assert rc == 2
+
+    def test_egress_guard_failure_exits_4(self, tmp_path, monkeypatch):
+        self._work_dir_factory(monkeypatch, tmp_path)
+        self._common_stubs(monkeypatch, tmp_path)
+        root = self._staged_repo(tmp_path)
+        monkeypatch.setattr(O, "ensure_egress_guard", lambda: False)
+        rc = O.main(["--project-root", str(root), "--no-preflight"])
+        assert rc == 4
+
+    def test_no_egress_guard_flag_bypasses_setup(self, tmp_path,
+                                                 monkeypatch):
+        self._work_dir_factory(monkeypatch, tmp_path)
+        self._common_stubs(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            O, "ensure_egress_guard",
+            lambda: pytest.fail("guard must not be set up when disabled"))
+        monkeypatch.setattr(
+            O, "run_reviewers_parallel",
+            _fake_reviewers((CLAUDE_ROUND1_RAW, GEMINI_ROUND1_RAW,
+                             DEEPSEEK_ROUND1_EMPTY), CROSS_CHECK_RAW))
+        root = self._staged_repo(tmp_path)
+        rc = O.main(["--project-root", str(root), "--no-preflight",
+                     "--no-test-runner", "--no-egress-guard"])
+        assert rc == 0
 
     # ----- happy paths -----
 

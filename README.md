@@ -98,6 +98,8 @@ Inside Claude Code:
 - Docker (for isolated reviewers and Semgrep)
 - `claude-reviewer:latest`, `gemini-reviewer:latest`, and `deepseek-reviewer:latest` images (see upstream)
 - `~/.config/gemini-api-key` and `~/.config/deepseek-api-key`
+- `ubuntu/squid:latest` (egress-guard proxy for the reviewers; pulled
+  automatically on first run)
 - Python 3.10+ (validator)
 - SonarQube images (`sonarqube:community`, `sonarsource/sonar-scanner-cli`),
   only needed when running with `--sonarqube`

@@ -108,10 +108,10 @@ class TestGeminiKeyHygiene:
         cmd = mrun.call_args[0][0]
         # Secret never appears anywhere in the ps-visible argv.
         assert all(SECRET not in tok for tok in cmd)
-        # Name-only env passthrough: `-e GEMINI_API_KEY` with no `=value`.
-        assert "-e" in cmd
-        e_idx = cmd.index("-e")
-        assert cmd[e_idx + 1] == "GEMINI_API_KEY"
+        # Name-only env passthrough: `-e GEMINI_API_KEY` with no `=value`
+        # (other -e entries, e.g. the egress proxy vars, may precede it).
+        assert "GEMINI_API_KEY" in cmd
+        assert cmd[cmd.index("GEMINI_API_KEY") - 1] == "-e"
         assert not any(tok.startswith("GEMINI_API_KEY=") for tok in cmd)
 
     def test_key_value_injected_via_subprocess_env(self, prompt_file, monkeypatch):
@@ -131,9 +131,8 @@ class TestDeepseekKeyHygiene:
             O.run_deepseek(prompt_file, Path("/fake/repo"))
         cmd = mrun.call_args[0][0]
         assert all(SECRET not in tok for tok in cmd)
-        assert "-e" in cmd
-        e_idx = cmd.index("-e")
-        assert cmd[e_idx + 1] == "DEEPSEEK_API_KEY"
+        assert "DEEPSEEK_API_KEY" in cmd
+        assert cmd[cmd.index("DEEPSEEK_API_KEY") - 1] == "-e"
         assert not any(tok.startswith("DEEPSEEK_API_KEY=") for tok in cmd)
 
     def test_key_value_injected_via_subprocess_env(self, prompt_file, monkeypatch):
@@ -250,3 +249,137 @@ class TestGeminiOutputCleaning:
         assert "Warning: Could not read" not in out
         assert "real finding one" in out
         assert "real finding two" in out
+
+
+# ---------- Prompt via stdin (ARG_MAX) ----------
+
+def _run_calls(mock):
+    """(cmd, kwargs) for every subprocess.run call on the mock."""
+    return [(c.args[0], c.kwargs) for c in mock.call_args_list]
+
+
+class TestPromptViaStdin:
+    """The prompt (up to 4000-line chunks) must reach the container via
+    stdin, never as a docker argv element (ARG_MAX)."""
+
+    @pytest.mark.parametrize("runner", ["run_claude", "run_gemini",
+                                        "run_deepseek"])
+    def test_prompt_absent_from_argv_and_passed_as_input(
+            self, prompt_file, monkeypatch, runner):
+        monkeypatch.setattr(O, "_read_gemini_key", lambda: SECRET)
+        monkeypatch.setattr(O, "_read_deepseek_key", lambda: SECRET)
+        with patch.object(O.subprocess, "run",
+                          return_value=_completed(0, stdout="ok")) as m:
+            getattr(O, runner)(prompt_file, Path("/fake/repo"))
+        cmd, kwargs = _run_calls(m)[0]
+        assert all("review this diff" not in tok for tok in cmd)
+        assert kwargs.get("input") == "review this diff"
+        assert "-i" in cmd
+
+
+# ---------- Egress guard ----------
+
+class TestEgressGuardArgs:
+    """Reviewers consume untrusted diffs while holding live creds; by
+    default they must join the internal egress network and speak only
+    through the allowlisting proxy."""
+
+    @pytest.mark.parametrize("runner", ["run_claude", "run_gemini",
+                                        "run_deepseek"])
+    def test_default_attaches_internal_network_and_proxy_env(
+            self, prompt_file, monkeypatch, runner):
+        monkeypatch.setattr(O, "_read_gemini_key", lambda: SECRET)
+        monkeypatch.setattr(O, "_read_deepseek_key", lambda: SECRET)
+        with patch.object(O.subprocess, "run",
+                          return_value=_completed(0, stdout="ok")) as m:
+            getattr(O, runner)(prompt_file, Path("/fake/repo"))
+        cmd, _ = _run_calls(m)[0]
+        joined = " ".join(cmd)
+        assert f"--network {O.EGRESS_NETWORK}" in joined
+        proxy = f"http://{O.EGRESS_PROXY_NAME}:{O.EGRESS_PROXY_PORT}"
+        assert f"HTTPS_PROXY={proxy}" in cmd[cmd.index("-e") :]
+        assert any(tok == f"HTTP_PROXY={proxy}" for tok in cmd)
+        assert any(tok.startswith("NO_PROXY=") for tok in cmd)
+
+    @pytest.mark.parametrize("runner", ["run_claude", "run_gemini",
+                                        "run_deepseek"])
+    def test_egress_false_leaves_network_open(self, prompt_file,
+                                              monkeypatch, runner):
+        monkeypatch.setattr(O, "_read_gemini_key", lambda: SECRET)
+        monkeypatch.setattr(O, "_read_deepseek_key", lambda: SECRET)
+        with patch.object(O.subprocess, "run",
+                          return_value=_completed(0, stdout="ok")) as m:
+            getattr(O, runner)(prompt_file, Path("/fake/repo"), egress=False)
+        cmd, _ = _run_calls(m)[0]
+        assert "--network" not in cmd
+        assert not any("PROXY" in tok for tok in cmd)
+
+
+class TestSquidConf:
+    def test_allowlist_hosts_and_default_deny(self):
+        conf = O._squid_conf()
+        for host in O.EGRESS_ALLOWED_HOSTS:
+            assert host in conf
+        assert "http_access deny all" in conf
+        # exact hosts only: a leading-dot dstdomain token is a wildcard and
+        # would reopen exfil channels like storage.googleapis.com
+        acl_line = next(ln for ln in conf.splitlines()
+                        if ln.startswith("acl allowed dstdomain"))
+        hosts = acl_line.split()[3:]
+        assert hosts and not any(h.startswith(".") for h in hosts)
+
+
+class TestEnsureEgressGuard:
+    def _mock_docker(self, responses):
+        """subprocess.run mock keyed on the docker subcommand tuple."""
+        def fake_run(cmd, **kwargs):
+            for key, rc in responses.items():
+                if list(key) == cmd[:len(key)]:
+                    return _completed(rc, args=cmd)
+            return _completed(0, args=cmd)
+        return fake_run
+
+    def test_creates_internal_network_when_missing(self, tmp_path,
+                                                   monkeypatch):
+        monkeypatch.setattr(O, "EGRESS_CONF_PATH", tmp_path / "squid.conf")
+        calls = []
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "network", "inspect"]:
+                return _completed(1, args=cmd)
+            if cmd[:2] == ["docker", "inspect"]:
+                return _completed(0, stdout="true\n", args=cmd)
+            return _completed(0, args=cmd)
+        with patch.object(O.subprocess, "run", side_effect=fake_run):
+            assert O.ensure_egress_guard() is True
+        create = next(c for c in calls
+                      if c[:3] == ["docker", "network", "create"])
+        assert "--internal" in create
+        assert O.EGRESS_NETWORK in create
+
+    def test_returns_false_when_network_create_fails(self, tmp_path,
+                                                     monkeypatch):
+        monkeypatch.setattr(O, "EGRESS_CONF_PATH", tmp_path / "squid.conf")
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["docker", "network", "inspect"]:
+                return _completed(1, args=cmd)
+            if cmd[:3] == ["docker", "network", "create"]:
+                return _completed(1, stderr="cannot create", args=cmd)
+            return _completed(0, args=cmd)
+        with patch.object(O.subprocess, "run", side_effect=fake_run):
+            assert O.ensure_egress_guard() is False
+
+    def test_recreates_proxy_when_conf_changed(self, tmp_path, monkeypatch):
+        conf_path = tmp_path / "squid.conf"
+        conf_path.write_text("stale config")
+        monkeypatch.setattr(O, "EGRESS_CONF_PATH", conf_path)
+        calls = []
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["docker", "inspect"]:
+                return _completed(0, stdout="true\n", args=cmd)
+            return _completed(0, args=cmd)
+        with patch.object(O.subprocess, "run", side_effect=fake_run):
+            assert O.ensure_egress_guard() is True
+        assert any(c[:3] == ["docker", "rm", "-f"] for c in calls)
+        assert conf_path.read_text() == O._squid_conf()

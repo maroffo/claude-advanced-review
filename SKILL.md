@@ -1,7 +1,7 @@
 ---
 name: advanced-review
 description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep as ground-truth reviewer (SonarQube opt-in via --sonarqube), hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest images available (sonarqube:community and sonarsource/sonar-scanner-cli only when --sonarqube is used); API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest, ubuntu/squid:latest images available (sonarqube:community and sonarsource/sonar-scanner-cli only when --sonarqube is used); API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
 ---
 
 # ABOUTME: Advanced code review with verifiable claims, SAST ground truth, and hostile cross-check
@@ -36,6 +36,7 @@ or `/advanced-review`.
 | `--no-preflight` | Skip the pre-flight make check gate | off (preflight runs) |
 | `--no-test-runner` | Skip executing proposed bug tests (step 4) | off (test runner runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
+| `--no-egress-guard` | Run reviewers with open network instead of the internal network + allowlist proxy (weakens exfiltration protection) | off (guard runs) |
 
 ## Run
 
@@ -125,33 +126,35 @@ fields depend on the category:
 three reviewers out on a thread pool with per-reviewer timeouts (Claude/Gemini
 300s, DeepSeek 600s for R1's reasoning phase) and a `reviewer status:` line on
 stderr; a non-zero exit (e.g. a `401`) is classified as a failed reviewer, not
-a finding. The docker commands below are reference documentation of what the
-orchestrator runs, not commands to launch by hand:
+a finding. The prompt is piped in via stdin (never argv: 4000-line chunks
+would flirt with ARG_MAX).
+
+**Egress guard.** Reviewer containers hold live credentials while consuming
+untrusted diffs, so by default they join an internal Docker network
+(`advanced-review-egress`, no default route) and reach the outside only
+through an allowlisting squid proxy (`advanced-review-proxy`, image
+`ubuntu/squid`). The allowlist covers exactly the model API hosts
+(`EGRESS_ALLOWED_HOSTS` in `orchestrator.py`); CONNECT to any other host is
+denied, so an injected prompt cannot exfiltrate the mounted creds or API
+keys. Setup is idempotent and fails closed: if the guard cannot start, the
+review aborts (exit 4) rather than running open-network. Override with
+`--no-egress-guard`.
+
+The docker command below (Claude reviewer; Gemini and DeepSeek follow the
+same pattern with their own env keys and CLI flags) is reference
+documentation of what the orchestrator runs, not a command to launch by
+hand:
 
 ```bash
-docker run --rm \
+docker run --rm -i \
+  --network advanced-review-egress \
+  -e HTTPS_PROXY=http://advanced-review-proxy:3128 \
+  -e HTTP_PROXY=http://advanced-review-proxy:3128 \
+  -e NO_PROXY=localhost,127.0.0.1 \
   -v claude-reviewer-auth:/home/node/.claude:ro \
   -v "$PROJECT_ROOT:/workspace:ro" \
   claude-reviewer:latest --print --model opus \
-  "$(cat "$PROMPT_FILE")"
-```
-
-```bash
-docker run --rm \
-  -e GEMINI_API_KEY="$(cat ~/.config/gemini-api-key)" \
-  -v "$PROJECT_ROOT:/workspace:ro" \
-  gemini-reviewer:latest -p "$(cat "$PROMPT_FILE")" \
-  -m gemini-3.1-pro-preview --sandbox false --skip-trust
-```
-
-```bash
-docker run --rm \
-  -e DEEPSEEK_API_KEY="$(cat ~/.config/deepseek-api-key)" \
-  -v "$PROJECT_ROOT:/workspace:ro" \
-  deepseek-reviewer:latest \
-  --provider deepseek --model deepseek-reasoner \
-  -p -t read --no-session \
-  "$(cat "$PROMPT_FILE")"
+  < "$PROMPT_FILE"
 ```
 
 ### Step 3 — Deterministic validator
@@ -340,6 +343,8 @@ The final report is markdown with sections by severity, each finding showing:
 | SonarQube port 9000 conflict | Stop conflicting service or change port in `sonarqube_runner.py` |
 | SonarQube token expired | Delete `~/.cache/claude-advanced-review/sonar-token` and rerun |
 | Claude auth fails | Re-login: `docker run -it --rm -v claude-reviewer-auth:/home/node/.claude --entrypoint bash claude-reviewer:latest -c "claude login"` |
+| Egress guard setup failed (exit 4) | Check Docker is running and `ubuntu/squid:latest` can be pulled; stale proxy: `docker rm -f advanced-review-proxy` and rerun. Last resort: `--no-egress-guard` (open network) |
+| Reviewer FAILED only with guard on | A CLI dependency needs a host missing from `EGRESS_ALLOWED_HOSTS` in `orchestrator.py`; add it there and rerun (the proxy is recreated automatically on allowlist change) |
 | Gemini API errors | Check `~/.config/gemini-api-key` exists and is valid |
 | Validator: "CWE list not found" | Delete `~/.cache/claude-advanced-review/cwe.json` and rerun (forces refresh) |
 | Test runner: "toolchain not detected" | Pass `--no-test-runner` to skip, or add a marker file the runner recognizes |

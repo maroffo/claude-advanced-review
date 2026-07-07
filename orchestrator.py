@@ -40,6 +40,100 @@ CLAUDE_TIMEOUT = 300
 GEMINI_TIMEOUT = 300
 DEEPSEEK_TIMEOUT = 600
 
+# ---------- Egress guard ----------
+# Reviewer containers hold live credentials while consuming untrusted diffs.
+# By default they join an internal (no default route) Docker network and can
+# only reach the outside through an allowlisting HTTP proxy, so an injected
+# prompt cannot exfiltrate the mounted creds or API keys.
+EGRESS_NETWORK = "advanced-review-egress"
+EGRESS_PROXY_NAME = "advanced-review-proxy"
+EGRESS_PROXY_IMAGE = "ubuntu/squid:latest"
+EGRESS_PROXY_PORT = 3128
+EGRESS_CONF_PATH = (Path.home() / ".cache" / "claude-advanced-review"
+                    / "squid.conf")
+# Exact hosts only. A wildcard like .googleapis.com would reopen
+# storage.googleapis.com as an exfiltration channel.
+EGRESS_ALLOWED_HOSTS = (
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "console.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "oauth2.googleapis.com",
+    "api.deepseek.com",
+)
+
+
+def _squid_conf() -> str:
+    hosts = " ".join(EGRESS_ALLOWED_HOSTS)
+    return (
+        f"http_port {EGRESS_PROXY_PORT}\n"
+        f"acl allowed dstdomain {hosts}\n"
+        "acl SSL_ports port 443\n"
+        "acl CONNECT method CONNECT\n"
+        "http_access deny CONNECT !SSL_ports\n"
+        "http_access allow allowed\n"
+        "http_access deny all\n"
+    )
+
+
+def _egress_args() -> list[str]:
+    proxy = f"http://{EGRESS_PROXY_NAME}:{EGRESS_PROXY_PORT}"
+    return [
+        "--network", EGRESS_NETWORK,
+        "-e", f"HTTPS_PROXY={proxy}",
+        "-e", f"HTTP_PROXY={proxy}",
+        "-e", "NO_PROXY=localhost,127.0.0.1",
+    ]
+
+
+def _docker(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker"] + args, capture_output=True,
+                          text=True, check=False, **kwargs)
+
+
+def ensure_egress_guard() -> bool:
+    """Idempotently set up the internal network and allowlist proxy.
+    Returns False on any setup failure; callers fail closed (abort the
+    review) rather than silently running reviewers with open egress."""
+    inspect = _docker(["network", "inspect", EGRESS_NETWORK])
+    if inspect.returncode != 0:
+        create = _docker(["network", "create", "--internal", EGRESS_NETWORK])
+        if create.returncode != 0:
+            print(f"egress guard: cannot create network: "
+                  f"{create.stderr.strip()}", file=sys.stderr)
+            return False
+
+    # Squid reads its config at container start (bind mount), so a changed
+    # allowlist requires recreating the proxy container.
+    conf = _squid_conf()
+    conf_changed = (not EGRESS_CONF_PATH.exists()
+                    or EGRESS_CONF_PATH.read_text() != conf)
+    if conf_changed:
+        EGRESS_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        EGRESS_CONF_PATH.write_text(conf)
+
+    running = _docker(["inspect", "-f", "{{.State.Running}}",
+                       EGRESS_PROXY_NAME])
+    proxy_up = running.returncode == 0 and running.stdout.strip() == "true"
+    if proxy_up and not conf_changed:
+        return True
+
+    _docker(["rm", "-f", EGRESS_PROXY_NAME])
+    run = _docker(["run", "-d", "--name", EGRESS_PROXY_NAME,
+                   "-v", f"{EGRESS_CONF_PATH}:/etc/squid/squid.conf:ro",
+                   EGRESS_PROXY_IMAGE])
+    if run.returncode != 0:
+        print(f"egress guard: cannot start proxy: {run.stderr.strip()}",
+              file=sys.stderr)
+        return False
+    connect = _docker(["network", "connect", EGRESS_NETWORK,
+                       EGRESS_PROXY_NAME])
+    if connect.returncode != 0 and "already exists" not in connect.stderr:
+        print(f"egress guard: cannot attach proxy to network: "
+              f"{connect.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
 
 def _read_gemini_key() -> str:
     if not GEMINI_KEY_PATH.exists():
@@ -77,17 +171,21 @@ def _classify_failure(name: str, proc: subprocess.CompletedProcess,
 
 
 def run_claude(prompt_file: Path, project_root: Path,
-               timeout: int = CLAUDE_TIMEOUT) -> str:
-    cmd = [
-        "docker", "run", "--rm",
+               timeout: int = CLAUDE_TIMEOUT, egress: bool = True) -> str:
+    # Prompt goes in via stdin (`-i`), not argv: 4000-line chunks would
+    # otherwise flirt with ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
         "-v", "claude-reviewer-auth:/home/node/.claude:ro",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         CLAUDE_IMAGE, "--print", "--model", "opus",
-        prompt_file.read_text(),
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout,
+                              input=prompt_file.read_text())
     except subprocess.TimeoutExpired:
         print(f"claude: FAILED (timeout after {timeout}s)", file=sys.stderr)
         return ""
@@ -98,16 +196,18 @@ def run_claude(prompt_file: Path, project_root: Path,
 
 
 def run_gemini(prompt_file: Path, project_root: Path,
-               timeout: int = GEMINI_TIMEOUT) -> str:
+               timeout: int = GEMINI_TIMEOUT, egress: bool = True) -> str:
     key = _read_gemini_key()
     # Pass the key by name only: Docker forwards the value from this process's
     # environment, keeping the secret out of the container's argv (ps-visible).
-    cmd = [
-        "docker", "run", "--rm",
+    # Prompt via stdin (`-i`, no `-p`): argv would flirt with ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
         "-e", "GEMINI_API_KEY",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         GEMINI_IMAGE,
-        "-p", prompt_file.read_text(),
         "-m", "gemini-3.1-pro-preview",
         "--sandbox", "false",
         "--skip-trust",
@@ -115,6 +215,7 @@ def run_gemini(prompt_file: Path, project_root: Path,
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout,
+                              input=prompt_file.read_text(),
                               env={**os.environ, "GEMINI_API_KEY": key})
     except subprocess.TimeoutExpired:
         print(f"gemini: FAILED (timeout after {timeout}s)", file=sys.stderr)
@@ -132,23 +233,27 @@ def run_gemini(prompt_file: Path, project_root: Path,
 
 
 def run_deepseek(prompt_file: Path, project_root: Path,
-                 timeout: int = DEEPSEEK_TIMEOUT) -> str:
+                 timeout: int = DEEPSEEK_TIMEOUT, egress: bool = True) -> str:
     key = _read_deepseek_key()
     # Pass the key by name only: Docker forwards the value from this process's
     # environment, keeping the secret out of the container's argv (ps-visible).
-    cmd = [
-        "docker", "run", "--rm",
+    # Prompt via stdin (`-i`, no positional arg): argv would flirt with
+    # ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
         "-e", "DEEPSEEK_API_KEY",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         DEEPSEEK_IMAGE,
         "--provider", "deepseek",
         "--model", "deepseek-reasoner",
         "-p", "-t", "read", "--no-session",
-        prompt_file.read_text(),
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout,
+                              input=prompt_file.read_text(),
                               env={**os.environ, "DEEPSEEK_API_KEY": key})
     except subprocess.TimeoutExpired:
         print(f"deepseek: FAILED (timeout after {timeout}s)", file=sys.stderr)
@@ -159,15 +264,18 @@ def run_deepseek(prompt_file: Path, project_root: Path,
     return proc.stdout
 
 
-def run_reviewers_parallel(prompt_file: Path,
-                           project_root: Path) -> tuple[str, str, str]:
+def run_reviewers_parallel(prompt_file: Path, project_root: Path,
+                           egress: bool = True) -> tuple[str, str, str]:
     """Run all three reviewers concurrently. A reviewer that fails (timeout,
     auth, crash) yields an empty string and is reported on stderr; the pipeline
     degrades to the survivors rather than aborting."""
     with cf.ThreadPoolExecutor(max_workers=3) as pool:
-        f_claude = pool.submit(run_claude, prompt_file, project_root)
-        f_gemini = pool.submit(run_gemini, prompt_file, project_root)
-        f_deepseek = pool.submit(run_deepseek, prompt_file, project_root)
+        f_claude = pool.submit(run_claude, prompt_file, project_root,
+                               egress=egress)
+        f_gemini = pool.submit(run_gemini, prompt_file, project_root,
+                               egress=egress)
+        f_deepseek = pool.submit(run_deepseek, prompt_file, project_root,
+                                 egress=egress)
         raw_claude = f_claude.result()
         raw_gemini = f_gemini.result()
         raw_deepseek = f_deepseek.result()
@@ -305,6 +413,22 @@ def _preflight_gate(project_root: Path, no_preflight: bool) -> int | None:
     return None
 
 
+def _egress_gate(args: argparse.Namespace) -> int | None:
+    """Bring up the egress guard before any reviewer runs. Returns 4 on
+    failure (caller aborts: fail closed, never silently open-network), or
+    None to proceed."""
+    if args.no_egress_guard:
+        print("egress guard: DISABLED (--no-egress-guard); reviewers run "
+              "with open network", file=sys.stderr)
+        return None
+    if not ensure_egress_guard():
+        print("egress guard: setup failed; refusing to run reviewers with "
+              "open egress (override with --no-egress-guard)",
+              file=sys.stderr)
+        return 4
+    return None
+
+
 def _parse_findings(raws: tuple[tuple[str, str, str], ...],
                     make_id) -> list[dict]:
     """Parse each reviewer's JSON and stamp a deterministic, source-prefixed
@@ -365,7 +489,7 @@ def _run_sonarqube_stage(args: argparse.Namespace, project_root: Path,
 def _run_cross_check(work_dir: Path, prompt_name: str,
                      cw_findings: list[dict], context_text: str,
                      diff: Any | None, project_root: Path,
-                     no_cross_check: bool,
+                     no_cross_check: bool, egress: bool = True,
                      ) -> tuple[dict[str, dict], dict[str, dict],
                                 dict[str, dict]]:
     """Hostile round-2 cross-check: build the prompt over CRITICAL/WARNING
@@ -381,7 +505,8 @@ def _run_cross_check(work_dir: Path, prompt_name: str,
     (work_dir / prompt_name).write_text(cross_prompt)
     print(f"round 2: cross-check on {len(cw_findings)} findings...",
           file=sys.stderr)
-    raw_c2 = run_reviewers_parallel(work_dir / prompt_name, project_root)
+    raw_c2 = run_reviewers_parallel(work_dir / prompt_name, project_root,
+                                    egress=egress)
     return _collect_verdicts(work_dir, diff, *raw_c2)
 
 
@@ -441,9 +566,15 @@ def pipeline(args: argparse.Namespace) -> int:
     round1_prompt = build_prompt(prompt_path, diff_text)
     (work_dir / "round1_prompt.md").write_text(round1_prompt)
 
+    # Egress guard just before any reviewer runs (fail closed).
+    rc = _egress_gate(args)
+    if rc is not None:
+        return rc
+
     print("round 1: running reviewers...", file=sys.stderr)
     raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
         work_dir / "round1_prompt.md", project_root,
+        egress=not args.no_egress_guard,
     )
     (work_dir / "round1_claude.txt").write_text(raw_claude)
     (work_dir / "round1_gemini.txt").write_text(raw_gemini)
@@ -509,7 +640,8 @@ def pipeline(args: argparse.Namespace) -> int:
     cw_findings.extend(sonar_cw)
     claude_verdicts, gemini_verdicts, deepseek_verdicts = _run_cross_check(
         work_dir, "round2_prompt.md", cw_findings, diff_text, diff,
-        project_root, args.no_cross_check)
+        project_root, args.no_cross_check,
+        egress=not args.no_egress_guard)
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(surviving, claude_verdicts,
@@ -551,6 +683,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                              "container on port 9000)")
     parser.add_argument("--no-cross-check", action="store_true")
     parser.add_argument("--no-test-runner", action="store_true")
+    parser.add_argument("--no-egress-guard", action="store_true",
+                        help="Run reviewers with open network instead of "
+                             "the internal network + allowlist proxy "
+                             "(weakens exfiltration protection)")
     args = parser.parse_args(argv)
     if args.base is not None:
         args.diff_mode = "branch"
@@ -594,6 +730,11 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     chunks = RC.chunk_by_directory(files)
     print(f"repo: {len(chunks)} chunks", file=sys.stderr)
 
+    # Egress guard just before any reviewer runs (fail closed).
+    rc = _egress_gate(args)
+    if rc is not None:
+        return rc
+
     # 3) LLM review per chunk
     prompt_path = REPO_ROOT / "prompts" / "repo-review.md"
     prompt_template = prompt_path.read_text()
@@ -626,7 +767,7 @@ def pipeline_repo(args: argparse.Namespace) -> int:
 
         # Run reviewers
         raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
-            prompt_file, project_root)
+            prompt_file, project_root, egress=not args.no_egress_guard)
         (work_dir / f"chunk_{i}_claude.txt").write_text(raw_claude)
         (work_dir / f"chunk_{i}_gemini.txt").write_text(raw_gemini)
         (work_dir / f"chunk_{i}_deepseek.txt").write_text(raw_deepseek)
@@ -681,7 +822,8 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     # Repo mode has no diff, so verdicts are taken raw (diff=None).
     claude_verdicts, gemini_verdicts, deepseek_verdicts = _run_cross_check(
         work_dir, "cross_check_prompt.md", cw_findings, file_context, None,
-        project_root, args.no_cross_check)
+        project_root, args.no_cross_check,
+        egress=not args.no_egress_guard)
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(all_findings, claude_verdicts,
