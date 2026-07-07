@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from runner import sonarqube_runner as SQ
 
@@ -239,13 +240,33 @@ class TestFetchIssues:
 
     @patch("runner.sonarqube_runner.requests.get")
     def test_api_error_returns_empty(self, mock_get):
+        import requests as _requests
         mock_resp = MagicMock()
         mock_resp.status_code = 500
-        mock_resp.raise_for_status.side_effect = Exception("server error")
+        mock_resp.raise_for_status.side_effect = _requests.exceptions.HTTPError(
+            "server error")
         mock_get.return_value = mock_resp
 
         issues = SQ.fetch_issues("cli-review", "tok-123", "http://localhost:9000")
         assert issues == []
+
+    @patch("runner.sonarqube_runner.requests.get")
+    def test_malformed_json_returns_empty(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("not json")
+        mock_get.return_value = mock_resp
+
+        issues = SQ.fetch_issues("cli-review", "tok-123", "http://localhost:9000")
+        assert issues == []
+
+    @patch("runner.sonarqube_runner.requests.get")
+    def test_unexpected_exception_propagates(self, mock_get):
+        # A bug (not a network/HTTP/JSON error) must NOT be masked as a clean
+        # scan: it has to surface rather than return [].
+        mock_get.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError):
+            SQ.fetch_issues("cli-review", "tok-123", "http://localhost:9000")
 
 
 # ---------- ensure_running tests ----------
@@ -307,8 +328,9 @@ class TestRunScan:
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         SQ.run_scan(Path("/fake/repo"), "my-project", "tok-123",
                     "http://localhost:9000")
-        cmd = " ".join(mock_run.call_args[0][0])
-        assert "sonar.working.dir" in cmd or "scannerwork" not in cmd
+        cmd = mock_run.call_args[0][0]
+        assert any(a.startswith("-Dsonar.working.dir=/tmp/.scannerwork-")
+                   for a in cmd)
 
     @patch("subprocess.run")
     def test_timeout_returns_false(self, mock_run):
@@ -362,3 +384,242 @@ class TestCleanupOldProjects:
             SQ.cleanup_old_projects("tok-123", "http://localhost:9000",
                                     max_age_hours=24)
             mock_post.assert_not_called()
+
+
+# ---------- map_result fallback tests ----------
+
+class TestMapResultFallbacks:
+    def test_unknown_severity_defaults_to_info(self):
+        f = SQ.map_result({"severity": "WHATEVER", "type": "BUG",
+                           "component": "k:x.go", "rule": "go:S1"})
+        assert f["severity"] == "INFO"
+
+    def test_unknown_type_defaults_to_quality(self):
+        f = SQ.map_result({"severity": "MAJOR", "type": "WHATEVER",
+                           "component": "k:x.go", "rule": "go:S1"})
+        assert f["category"] == "quality"
+
+
+# ---------- cache dir / credentials fixture ----------
+
+@pytest.fixture
+def cache_dir(tmp_path, monkeypatch):
+    """Redirect the module's cache paths into a temp dir."""
+    monkeypatch.setattr(SQ, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(SQ, "TOKEN_CACHE_PATH", tmp_path / "sonar-token")
+    monkeypatch.setattr(SQ, "ADMIN_PASS_PATH", tmp_path / "sonar-admin-pass")
+    return tmp_path
+
+
+# ---------- _admin_password tests ----------
+
+class TestAdminPassword:
+    def test_generates_and_persists_with_0600(self, cache_dir):
+        pw = SQ._admin_password()
+        assert pw
+        assert SQ.ADMIN_PASS_PATH.read_text().strip() == pw
+        assert (SQ.ADMIN_PASS_PATH.stat().st_mode & 0o777) == 0o600
+        assert (cache_dir.stat().st_mode & 0o777) == 0o700
+
+    def test_is_stable_across_calls(self, cache_dir):
+        assert SQ._admin_password() == SQ._admin_password()
+
+    def test_not_the_removed_static_secret(self, cache_dir):
+        assert SQ._admin_password() != "reviewpass!2026"
+
+
+# ---------- _working_admin_password tests ----------
+
+class TestWorkingAdminPassword:
+    @patch("runner.sonarqube_runner.requests.get")
+    def test_prefers_persisted_password(self, mock_get, cache_dir, monkeypatch):
+        monkeypatch.setattr(SQ, "_admin_password", lambda: "PERSISTED")
+
+        def validate(url, auth=None, timeout=None):
+            ok = auth[0] == "admin" and auth[1] == "PERSISTED"
+            return MagicMock(status_code=200 if ok else 401,
+                             json=lambda: {"valid": ok})
+        mock_get.side_effect = validate
+        assert SQ._working_admin_password() == "PERSISTED"
+
+    @patch("runner.sonarqube_runner.requests.get")
+    def test_falls_back_to_default(self, mock_get, cache_dir, monkeypatch):
+        monkeypatch.setattr(SQ, "_admin_password", lambda: "PERSISTED")
+
+        def validate(url, auth=None, timeout=None):
+            ok = auth[1] == SQ.DEFAULT_ADMIN_PASS
+            return MagicMock(status_code=200 if ok else 401,
+                             json=lambda: {"valid": ok})
+        mock_get.side_effect = validate
+        assert SQ._working_admin_password() == SQ.DEFAULT_ADMIN_PASS
+
+
+# ---------- _ensure_token tests ----------
+
+class TestEnsureToken:
+    def test_returns_cached_token_when_valid(self, cache_dir, monkeypatch):
+        SQ.TOKEN_CACHE_PATH.write_text("cached-tok")
+        monkeypatch.setattr(SQ, "_token_valid", lambda t: True)
+        # If it tried to change the password it would hit the network.
+        monkeypatch.setattr(SQ, "_change_default_password",
+                            lambda: pytest.fail("should not re-provision"))
+        assert SQ._ensure_token() == "cached-tok"
+
+    @patch("runner.sonarqube_runner.requests.post")
+    def test_generates_and_caches_token_with_0600(self, mock_post, cache_dir,
+                                                   monkeypatch):
+        monkeypatch.setattr(SQ, "_token_valid", lambda t: False)
+        monkeypatch.setattr(SQ, "_change_default_password", lambda: None)
+        monkeypatch.setattr(SQ, "_working_admin_password", lambda: "PW")
+        mock_post.return_value = MagicMock(
+            json=lambda: {"token": "fresh-tok"},
+            raise_for_status=lambda: None)
+
+        token = SQ._ensure_token()
+        assert token == "fresh-tok"
+        assert SQ.TOKEN_CACHE_PATH.read_text() == "fresh-tok"
+        assert (SQ.TOKEN_CACHE_PATH.stat().st_mode & 0o777) == 0o600
+        assert (cache_dir.stat().st_mode & 0o777) == 0o700
+
+
+# ---------- _changed_paths tests ----------
+
+class TestChangedPaths:
+    def _make_repo(self, tmp_path):
+        (tmp_path / "a.py").write_text("x\n")
+        (tmp_path / "b.py").write_text("y\n")
+        return tmp_path
+
+    @patch("runner.sonarqube_runner._git_cmd")
+    def test_staged_mode_git_args(self, mock_git, tmp_path):
+        self._make_repo(tmp_path)
+        mock_git.return_value = "a.py\nb.py"
+        SQ._changed_paths(tmp_path, "staged", "main")
+        args = list(mock_git.call_args[0][1:])
+        assert args == ["diff", "--cached", "--name-only"]
+
+    @patch("runner.sonarqube_runner._git_cmd")
+    def test_all_mode_git_args(self, mock_git, tmp_path):
+        mock_git.return_value = ""
+        SQ._changed_paths(tmp_path, "all", "main")
+        assert list(mock_git.call_args[0][1:]) == ["diff", "HEAD", "--name-only"]
+
+    @patch("runner.sonarqube_runner._git_cmd")
+    def test_branch_mode_git_args(self, mock_git, tmp_path):
+        mock_git.return_value = ""
+        SQ._changed_paths(tmp_path, "branch", "develop")
+        assert list(mock_git.call_args[0][1:]) == [
+            "diff", "develop...HEAD", "--name-only"]
+
+    @patch("runner.sonarqube_runner._git_cmd")
+    def test_filters_out_deleted_files(self, mock_git, tmp_path):
+        self._make_repo(tmp_path)
+        mock_git.return_value = "a.py\nb.py\ngone.py"
+        assert SQ._changed_paths(tmp_path, "staged", "main") == ["a.py", "b.py"]
+
+    def test_unknown_mode_returns_empty(self, tmp_path):
+        assert SQ._changed_paths(tmp_path, "bogus", "main") == []
+
+
+# ---------- _minimal_covering_dirs tests ----------
+
+class TestMinimalCoveringDirs:
+    def test_collapses_nested_dirs(self):
+        assert SQ._minimal_covering_dirs(
+            ["a/b/x.ts", "a/b/c/y.ts"]) == ["a/b"]
+
+    def test_root_level_path_forces_full_scan(self):
+        assert SQ._minimal_covering_dirs(["a/b/x.ts", "top.ts"]) == []
+
+    def test_empty_returns_empty(self):
+        assert SQ._minimal_covering_dirs([]) == []
+
+
+# ---------- _find_tsconfigs tests ----------
+
+class TestFindTsconfigs:
+    def test_walks_up_to_nearest(self, tmp_path):
+        (tmp_path / "pkg" / "src").mkdir(parents=True)
+        (tmp_path / "pkg" / "tsconfig.json").write_text("{}")
+        assert SQ._find_tsconfigs(tmp_path, ["pkg/src"]) == ["pkg/tsconfig.json"]
+
+    def test_falls_back_to_root(self, tmp_path):
+        (tmp_path / "pkg" / "src").mkdir(parents=True)
+        (tmp_path / "tsconfig.json").write_text("{}")
+        assert SQ._find_tsconfigs(tmp_path, ["pkg/src"]) == ["tsconfig.json"]
+
+    def test_none_found_returns_empty(self, tmp_path):
+        (tmp_path / "pkg" / "src").mkdir(parents=True)
+        assert SQ._find_tsconfigs(tmp_path, ["pkg/src"]) == []
+
+
+# ---------- scoped run_scan tests ----------
+
+class TestRunScanScoped:
+    @patch("subprocess.run")
+    def test_scoped_sources_and_tsconfig(self, mock_run, tmp_path):
+        (tmp_path / "pkg" / "src").mkdir(parents=True)
+        (tmp_path / "pkg" / "tsconfig.json").write_text("{}")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        SQ.run_scan(tmp_path, "k", "tok", "http://localhost:9000",
+                    sources=["pkg/src"])
+        cmd = mock_run.call_args[0][0]
+        assert "-Dsonar.sources=/usr/src/pkg/src" in cmd
+        assert any(a.startswith("-Dsonar.exclusions=") for a in cmd)
+        assert "-Dsonar.typescript.tsconfigPaths=/usr/src/pkg/tsconfig.json" in cmd
+
+    @patch("subprocess.run")
+    def test_uses_add_host_not_network_host(self, mock_run, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        SQ.run_scan(tmp_path, "k", "tok", "http://localhost:9000")
+        cmd = mock_run.call_args[0][0]
+        assert "host" not in cmd  # no bare `--network host`
+        assert f"{SQ.SCANNER_HOST_ALIAS}:host-gateway" in cmd
+        assert any(f"SONAR_HOST_URL=http://{SQ.SCANNER_HOST_ALIAS}:9000" in a
+                   for a in cmd)
+
+
+# ---------- run_sonarqube orchestration tests ----------
+
+class TestRunSonarqube:
+    def test_server_down_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(SQ, "ensure_running", lambda *a, **k: False)
+        assert SQ.run_sonarqube(Path("/fake")) == []
+
+    def test_scan_failure_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(SQ, "ensure_running", lambda *a, **k: True)
+        monkeypatch.setattr(SQ, "_ensure_token", lambda: "tok")
+        monkeypatch.setattr(SQ, "cleanup_old_projects", lambda *a, **k: None)
+        monkeypatch.setattr(SQ, "generate_project_key", lambda r: "key")
+        monkeypatch.setattr(SQ, "run_scan", lambda *a, **k: False)
+        assert SQ.run_sonarqube(Path("/fake")) == []
+
+    def test_happy_path_maps_findings(self, monkeypatch):
+        monkeypatch.setattr(SQ, "ensure_running", lambda *a, **k: True)
+        monkeypatch.setattr(SQ, "_ensure_token", lambda: "tok")
+        monkeypatch.setattr(SQ, "cleanup_old_projects", lambda *a, **k: None)
+        monkeypatch.setattr(SQ, "generate_project_key", lambda r: "key")
+        monkeypatch.setattr(SQ, "run_scan", lambda *a, **k: True)
+        monkeypatch.setattr(SQ, "fetch_issues",
+                            lambda *a, **k: SONAR_ISSUES_RESPONSE["issues"])
+        out = SQ.run_sonarqube(Path("/fake"))
+        assert len(out) == 3
+        assert out[0]["source"] == "sonarqube"
+
+    def test_root_level_change_falls_back_to_full_scan(self, monkeypatch):
+        captured = {}
+
+        def fake_scan(root, key, token, timeout=1800, sources=None):
+            captured["sources"] = sources
+            return True
+        monkeypatch.setattr(SQ, "ensure_running", lambda *a, **k: True)
+        monkeypatch.setattr(SQ, "_ensure_token", lambda: "tok")
+        monkeypatch.setattr(SQ, "cleanup_old_projects", lambda *a, **k: None)
+        monkeypatch.setattr(SQ, "generate_project_key", lambda r: "key")
+        # A root-level change -> _minimal_covering_dirs == [] -> None.
+        monkeypatch.setattr(SQ, "_changed_paths",
+                            lambda *a, **k: ["top.py"])
+        monkeypatch.setattr(SQ, "run_scan", fake_scan)
+        monkeypatch.setattr(SQ, "fetch_issues", lambda *a, **k: [])
+        SQ.run_sonarqube(Path("/fake"), diff_mode="staged")
+        assert captured["sources"] is None

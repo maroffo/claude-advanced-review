@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
-from merge.merger import classify_confidence, build_report, deduplicate_findings
+from merge.merger import (
+    annotate_with_verdicts,
+    build_report,
+    classify_confidence,
+    deduplicate_findings,
+)
 
 
 def _accept(finding_id: str = "f1") -> dict:
@@ -196,3 +201,100 @@ class TestDeduplicateFindings:
         result = deduplicate_findings(findings)
         assert len(result) == 1
         assert result[0]["severity"] == "WARNING"
+
+    def test_keeps_highest_severity_when_seen_first(self):
+        # Higher severity arrives first: it must be retained, not overwritten
+        # by the later lower-severity duplicate.
+        findings = [
+            {"file": "a.py", "category": "security", "severity": "CRITICAL",
+             "problem": "SQL injection in query builder"},
+            {"file": "a.py", "category": "security", "severity": "WARNING",
+             "problem": "SQL injection in query builder"},
+        ]
+        result = deduplicate_findings(findings)
+        assert len(result) == 1
+        assert result[0]["severity"] == "CRITICAL"
+
+
+def _finding(fid: str = "f1", severity: str = "WARNING") -> dict:
+    return {"id": fid, "severity": severity, "category": "bug",
+            "file": "a.py", "line": 1, "problem": "p", "suggestion": "s"}
+
+
+def _modify_verdict(fid: str = "f1", severity: str | None = None,
+                    suggestion: str | None = None) -> dict:
+    mod: dict = {}
+    if severity is not None:
+        mod["severity"] = severity
+    if suggestion is not None:
+        mod["suggestion"] = suggestion
+    return {"finding_id": fid, "verdict": "MODIFY", "modification": mod,
+            "validator_status": "passed"}
+
+
+class TestModifySeverity:
+    """annotate_with_verdicts must never let a MODIFY downgrade a finding, and
+    the highest proposed severity wins when reviewers disagree."""
+
+    def test_upgrade_is_applied_and_original_preserved(self):
+        f = _finding(severity="INFO")
+        v = _modify_verdict(severity="CRITICAL")
+        out = annotate_with_verdicts([f], {"f1": v}, {})[0]
+        assert out["severity"] == "CRITICAL"
+        assert out["original_severity"] == "INFO"
+
+    def test_downgrade_is_ignored(self):
+        f = _finding(severity="CRITICAL")
+        v = _modify_verdict(severity="INFO")
+        out = annotate_with_verdicts([f], {"f1": v}, {})[0]
+        assert out["severity"] == "CRITICAL"
+        assert "original_severity" not in out
+
+    def test_highest_wins_across_reviewers(self):
+        f = _finding(severity="INFO")
+        cv = _modify_verdict(severity="WARNING")
+        gv = _modify_verdict(severity="CRITICAL")
+        out = annotate_with_verdicts([f], {"f1": cv}, {"f1": gv})[0]
+        assert out["severity"] == "CRITICAL"
+        assert out["original_severity"] == "INFO"
+
+    def test_equal_severity_leaves_original_untouched(self):
+        f = _finding(severity="WARNING")
+        v = _modify_verdict(severity="WARNING")
+        out = annotate_with_verdicts([f], {"f1": v}, {})[0]
+        assert out["severity"] == "WARNING"
+        assert "original_severity" not in out
+
+    def test_modified_suggestion_surfaces(self):
+        f = _finding()
+        v = _modify_verdict(suggestion="Use a bound query instead.")
+        out = annotate_with_verdicts([f], {"f1": v}, {})[0]
+        assert out["modified_suggestion"] == "Use a bound query instead."
+
+
+class TestRenderFindingEvidence:
+    def _report(self, finding: dict) -> str:
+        finding = {"severity": "WARNING", "file": "a.py", "line": 1,
+                   "problem": "p", "category": "bug", **finding}
+        return build_report([finding])
+
+    def test_renders_big_o(self):
+        report = self._report({"evidence": {"big_o": "O(n^2)"}})
+        assert "**Big-O:** O(n^2)" in report
+
+    def test_renders_convention_file(self):
+        report = self._report({"evidence": {
+            "convention_file": "STYLE.md",
+            "convention_line_or_grep": "no bare except"}})
+        assert "**Convention:**" in report
+        assert "STYLE.md" in report
+
+    def test_renders_principle(self):
+        report = self._report({"evidence": {"principle": "Single Responsibility"}})
+        assert "**Principle:** Single Responsibility" in report
+
+    def test_renders_red_green_test_path(self):
+        report = self._report({
+            "test_path": "tests/test_a.py",
+            "evidence": {"test_target_file": "a.py"}})
+        assert "**Red-green test:** `tests/test_a.py`" in report
