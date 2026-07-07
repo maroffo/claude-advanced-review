@@ -228,6 +228,7 @@ def run_gemini(prompt_file: Path, project_root: Path,
         line for line in proc.stdout.splitlines()
         if not line.startswith("[WARN] Skipping unreadable")
         and not line.startswith("Warning: Could not read")
+        and not line.startswith("[STARTUP]")
     )
     return cleaned
 
@@ -735,7 +736,11 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     if rc is not None:
         return rc
 
-    # 3) LLM review per chunk
+    # 3) LLM review per chunk.
+    # Repo mode always uses repo-review.md and ignores --prompt on purpose:
+    # only this template carries the {{SKELETON}}/{{FILES}} placeholders that
+    # the per-chunk injection below fills. default.md / ci-style.md lack them,
+    # so honoring --prompt here would silently review empty chunks.
     prompt_path = REPO_ROOT / "prompts" / "repo-review.md"
     prompt_template = prompt_path.read_text()
     cwe = V.CWEStore()
