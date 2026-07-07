@@ -29,12 +29,24 @@ or `/advanced-review`.
 |--------|-------------|---------|
 | `--all` | Review all uncommitted changes | staged only |
 | `--branch [base]` | Review current branch vs base | `main` |
-| `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
-| `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
+| `--prompt <name>` | Prompt template: `default`, `ci-style`, or `repo-review` (auto-used in `--repo` mode) | `default` |
+| `--no-semgrep` | Skip the Semgrep ground-truth reviewer | off (Semgrep runs) |
 | `--sonarqube` | Run the SonarQube ground-truth reviewer (persistent container, port 9000) | off (opt-in) |
 | `--repo [path]` | Full-repo review (optionally scoped to path) | off (diff mode) |
 | `--no-preflight` | Skip the pre-flight make check gate | off (preflight runs) |
+| `--no-test-runner` | Skip executing proposed bug tests (step 4) | off (test runner runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
+
+## Run
+
+From the skill directory:
+
+```bash
+./orchestrator.sh [options]
+```
+
+`--project-root` selects the git repository to review; it defaults to the
+current working directory.
 
 ## Execution Flow
 
@@ -109,10 +121,12 @@ fields depend on the category:
 | `architecture` | `principle` + `application` (specific to the diff) |
 | `nitpick` | none, auto-demoted to `INFO` |
 
-Launch in parallel (single message, three Bash calls). `orchestrator.py` does
-this with a thread pool, per-reviewer timeouts (Claude/Gemini 300s, DeepSeek
-600s for R1's reasoning phase), and a `reviewer status:` line on stderr; a
-non-zero exit (e.g. a `401`) is classified as a failed reviewer, not a finding:
+`orchestrator.py` handles the parallelism: `run_reviewers_parallel` fans the
+three reviewers out on a thread pool with per-reviewer timeouts (Claude/Gemini
+300s, DeepSeek 600s for R1's reasoning phase) and a `reviewer status:` line on
+stderr; a non-zero exit (e.g. a `401`) is classified as a failed reviewer, not
+a finding. The docker commands below are reference documentation of what the
+orchestrator runs, not commands to launch by hand:
 
 ```bash
 docker run --rm \
@@ -147,7 +161,9 @@ docker run --rm \
 1. **CWE existence**: `cwe_id` must exist in the MITRE CWE list (downloaded
    on first run, cached at `~/.cache/claude-advanced-review/cwe.json` with 30d
    TTL).
-2. **URL reachability**: `cwe_url` must return HTTP 200 (HEAD, 5s timeout).
+2. **URL reachability**: `cwe_url` must be `https://cwe.mitre.org/...`
+   (allowlist, no other host is ever fetched) and return HTTP 200
+   (HEAD, 5s timeout).
 3. **Test syntax**: `evidence.test` must parse as valid code in its declared
    language (Python `ast`, JS/TS via regex-level check, Go via `go/parser`,
    etc.).
@@ -161,9 +177,11 @@ transparency). Findings move forward with `validator_status: "passed"`.
 
 ### Step 4 — External test runner
 
-`runner/test-runner.sh` takes surviving `bug` findings and executes their
-proposed tests against the current codebase. The runner detects project
-toolchain by glob:
+`runner/test_runner.py` takes surviving `bug` findings and executes their
+proposed tests against the current codebase. Each proposed test runs inside an
+ephemeral, network-less Docker container (`--network none`) so untrusted
+reviewer-authored test code cannot touch the host or reach the network. The
+runner detects project toolchain by glob:
 
 | Marker file | Runner |
 |-------------|--------|
@@ -186,7 +204,7 @@ file doesn't exist.
 
 ### Step 5 — Semgrep (third reviewer, ground truth)
 
-`runner/semgrep-runner.sh` runs `semgrep/semgrep:latest` with `--config=auto`
+`runner/semgrep_runner.py` runs `semgrep/semgrep:latest` with `--config=auto`
 on the project. Output is parsed into the same finding schema used by the LLM
 reviewers. Semgrep findings are tagged `source: "semgrep"` and **skip the
 validator**: they are ground truth by construction.
