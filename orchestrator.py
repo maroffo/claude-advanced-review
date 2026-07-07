@@ -382,9 +382,9 @@ def pipeline(args: argparse.Namespace) -> int:
             json.dumps({"findings": semgrep_findings}, indent=2))
         print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
 
-    # 5b) SonarQube (ground truth, persistent container)
+    # 5b) SonarQube (opt-in ground truth, persistent container)
     sonar_findings: list[dict] = []
-    if not args.no_sonarqube:
+    if args.sonarqube:
         print("sonarqube: running...", file=sys.stderr)
         sonar_findings = SQ.run_sonarqube(
             project_root,
@@ -394,6 +394,9 @@ def pipeline(args: argparse.Namespace) -> int:
         (work_dir / "sonarqube.json").write_text(
             json.dumps({"findings": sonar_findings}, indent=2))
         print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+    else:
+        print("sonarqube: skipped (opt-in; pass --sonarqube to enable)",
+              file=sys.stderr)
 
     # 6) Cross-check round 2
     # Include CRITICAL/WARNING from LLM surviving + SonarQube ground truth
@@ -465,7 +468,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         choices=("default", "ci-style", "repo-review"))
     parser.add_argument("--no-preflight", action="store_true")
     parser.add_argument("--no-semgrep", action="store_true")
-    parser.add_argument("--no-sonarqube", action="store_true")
+    parser.add_argument("--sonarqube", action="store_true",
+                        help="Run the SonarQube ground-truth reviewer "
+                             "(opt-in: needs Docker images and a persistent "
+                             "container on port 9000)")
     parser.add_argument("--no-cross-check", action="store_true")
     parser.add_argument("--no-test-runner", action="store_true")
     args = parser.parse_args(argv)
@@ -588,9 +594,9 @@ def pipeline_repo(args: argparse.Namespace) -> int:
         semgrep_findings = SR.parse_output(raw)
         print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
 
-    # 5b) SonarQube
+    # 5b) SonarQube (opt-in)
     sonar_findings: list[dict] = []
-    if not args.no_sonarqube:
+    if args.sonarqube:
         print("sonarqube: running...", file=sys.stderr)
         sonar_findings = SQ.run_sonarqube(
             project_root,
@@ -598,6 +604,9 @@ def pipeline_repo(args: argparse.Namespace) -> int:
             base_ref=args.base,
         )
         print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+    else:
+        print("sonarqube: skipped (opt-in; pass --sonarqube to enable)",
+              file=sys.stderr)
 
     # 6) Cross-check on CRITICAL/WARNING
     cw_findings = [f for f in all_findings

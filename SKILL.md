@@ -1,7 +1,7 @@
 ---
 name: advanced-review
-description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep and SonarQube as ground-truth reviewers, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest, sonarqube:community, sonarsource/sonar-scanner-cli images available; API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
+description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep as ground-truth reviewer (SonarQube opt-in via --sonarqube), hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest images available (sonarqube:community and sonarsource/sonar-scanner-cli only when --sonarqube is used); API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
 ---
 
 # ABOUTME: Advanced code review with verifiable claims, SAST ground truth, and hostile cross-check
@@ -11,7 +11,8 @@ compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer
 
 Three LLM reviewers (Claude, Gemini, DeepSeek, three different labs) run in
 isolated Docker containers, a deterministic validator filters unprovable claims,
-Semgrep and SonarQube provide zero-hallucination ground truth, and a hostile
+Semgrep provides zero-hallucination ground truth (SonarQube can join as a
+second ground-truth reviewer with `--sonarqube`), and a hostile
 cross-check round tries to demolish what survives. Humans only see findings that
 cleared every gate. A reviewer that fails (timeout, expired auth, rate limit)
 is reported on stderr and the pipeline degrades to the survivors rather than
@@ -30,7 +31,7 @@ or `/advanced-review`.
 | `--branch [base]` | Review current branch vs base | `main` |
 | `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
 | `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
-| `--no-sonarqube` | Skip the SonarQube reviewer | off (SonarQube runs) |
+| `--sonarqube` | Run the SonarQube ground-truth reviewer (persistent container, port 9000) | off (opt-in) |
 | `--repo [path]` | Full-repo review (optionally scoped to path) | off (diff mode) |
 | `--no-preflight` | Skip the pre-flight make check gate | off (preflight runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
@@ -72,7 +73,8 @@ full-repository review. Instead of generating a diff, it:
 5. **Validator checks file/line existence** (no diff relevance check).
 6. **Cross-chunk deduplication** merges findings with same file + category +
    problem description, keeping the highest severity.
-7. Steps 5-7 (Semgrep, SonarQube, cross-check, merge) run as usual.
+7. Steps 5-7 (Semgrep, SonarQube if `--sonarqube`, cross-check, merge) run
+   as usual.
 
 **Cost note:** `--repo` on a large codebase can be expensive. Use `--repo src/`
 to scope to specific directories.
@@ -197,12 +199,17 @@ Semgrep's role:
 
 Skip with `--no-semgrep`.
 
-### Step 5b — SonarQube (ground truth, persistent container)
+### Step 5b — SonarQube (opt-in ground truth, persistent container)
 
-`runner/sonarqube_runner.py` manages a persistent `sonarqube-review` Docker
-container running SonarQube Community Build. The container starts on first use
-(~60-120s cold start) and stays running for subsequent reviews (~10-30s per
-scan).
+**Opt-in: runs only with `--sonarqube`.** Skipped by default because it
+requires a persistent server container on port 9000 and two extra Docker
+images; on a machine without them the step would spend minutes pulling and
+booting SonarQube before contributing anything.
+
+When enabled, `runner/sonarqube_runner.py` manages a persistent
+`sonarqube-review` Docker container running SonarQube Community Build. The
+container starts on first use (~60-120s cold start) and stays running for
+subsequent reviews (~10-30s per scan).
 
 **Flow:**
 
@@ -236,8 +243,6 @@ scan).
 SonarQube findings are tagged `source: "sonarqube"` and are **ground truth**
 (bypass the validator). CRITICAL/WARNING findings enter the cross-check round 2
 where LLMs can dispute contextual relevance but not structural existence.
-
-Skip with `--no-sonarqube`.
 
 ### Step 6 — Round 2 cross-check (hostile defense)
 
