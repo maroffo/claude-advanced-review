@@ -240,6 +240,7 @@ class TestGeminiOutputCleaning:
             "[WARN] Skipping unreadable /workspace/foo\n"
             "real finding one\n"
             "Warning: Could not read /workspace/bar\n"
+            "[STARTUP] Phase 'cleanup_ops' was started but never ended.\n"
             "real finding two\n"
         )
         with patch.object(O.subprocess, "run",
@@ -247,6 +248,7 @@ class TestGeminiOutputCleaning:
             out = O.run_gemini(prompt_file, Path("/fake/repo"))
         assert "[WARN] Skipping unreadable" not in out
         assert "Warning: Could not read" not in out
+        assert "[STARTUP]" not in out
         assert "real finding one" in out
         assert "real finding two" in out
 
