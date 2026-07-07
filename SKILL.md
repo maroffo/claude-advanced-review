@@ -1,7 +1,7 @@
 ---
 name: advanced-review
-description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep and SonarQube as ground-truth reviewers, hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
-compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest, sonarqube:community, sonarsource/sonar-scanner-cli images available; API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
+description: "Thorough code review with verifiable claims. Three isolated reviewers (Claude + Gemini + DeepSeek in Docker), deterministic validator, Semgrep as ground-truth reviewer (SonarQube opt-in via --sonarqube), hostile cross-check round. Every finding must carry evidence: CWE id, executable red-green test, Big-O derivation, grep-able convention reference, or explicit principle. Use when user says advanced review, thorough review, deep review, or /advanced-review. For quick pre-commit review use gemini-review instead."
+compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer:latest, deepseek-reviewer:latest, semgrep/semgrep:latest, ubuntu/squid:latest images available (sonarqube:community and sonarsource/sonar-scanner-cli only when --sonarqube is used); API key files at ~/.config/gemini-api-key and ~/.config/deepseek-api-key; Python 3.10+ on host for the validator."
 ---
 
 # ABOUTME: Advanced code review with verifiable claims, SAST ground truth, and hostile cross-check
@@ -11,7 +11,8 @@ compatibility: "Requires Docker running; claude-reviewer:latest, gemini-reviewer
 
 Three LLM reviewers (Claude, Gemini, DeepSeek, three different labs) run in
 isolated Docker containers, a deterministic validator filters unprovable claims,
-Semgrep and SonarQube provide zero-hallucination ground truth, and a hostile
+Semgrep provides zero-hallucination ground truth (SonarQube can join as a
+second ground-truth reviewer with `--sonarqube`), and a hostile
 cross-check round tries to demolish what survives. Humans only see findings that
 cleared every gate. A reviewer that fails (timeout, expired auth, rate limit)
 is reported on stderr and the pipeline degrades to the survivors rather than
@@ -28,12 +29,25 @@ or `/advanced-review`.
 |--------|-------------|---------|
 | `--all` | Review all uncommitted changes | staged only |
 | `--branch [base]` | Review current branch vs base | `main` |
-| `--prompt <name>` | Prompt template: `default` or `ci-style` | `default` |
-| `--no-semgrep` | Skip the Semgrep third reviewer | off (Semgrep runs) |
-| `--no-sonarqube` | Skip the SonarQube reviewer | off (SonarQube runs) |
+| `--prompt <name>` | Prompt template: `default`, `ci-style`, or `repo-review` (auto-used in `--repo` mode) | `default` |
+| `--no-semgrep` | Skip the Semgrep ground-truth reviewer | off (Semgrep runs) |
+| `--sonarqube` | Run the SonarQube ground-truth reviewer (persistent container, port 9000) | off (opt-in) |
 | `--repo [path]` | Full-repo review (optionally scoped to path) | off (diff mode) |
 | `--no-preflight` | Skip the pre-flight make check gate | off (preflight runs) |
+| `--no-test-runner` | Skip executing proposed bug tests (step 4) | off (test runner runs) |
 | `--no-cross-check` | Skip round 2 (faster, less rigorous) | off (cross-check runs) |
+| `--no-egress-guard` | Run reviewers with open network instead of the internal network + allowlist proxy (weakens exfiltration protection) | off (guard runs) |
+
+## Run
+
+From the skill directory:
+
+```bash
+./orchestrator.sh [options]
+```
+
+`--project-root` selects the git repository to review; it defaults to the
+current working directory.
 
 ## Execution Flow
 
@@ -72,7 +86,8 @@ full-repository review. Instead of generating a diff, it:
 5. **Validator checks file/line existence** (no diff relevance check).
 6. **Cross-chunk deduplication** merges findings with same file + category +
    problem description, keeping the highest severity.
-7. Steps 5-7 (Semgrep, SonarQube, cross-check, merge) run as usual.
+7. Steps 5-7 (Semgrep, SonarQube if `--sonarqube`, cross-check, merge) run
+   as usual.
 
 **Cost note:** `--repo` on a large codebase can be expensive. Use `--repo src/`
 to scope to specific directories.
@@ -107,35 +122,39 @@ fields depend on the category:
 | `architecture` | `principle` + `application` (specific to the diff) |
 | `nitpick` | none, auto-demoted to `INFO` |
 
-Launch in parallel (single message, three Bash calls). `orchestrator.py` does
-this with a thread pool, per-reviewer timeouts (Claude/Gemini 300s, DeepSeek
-600s for R1's reasoning phase), and a `reviewer status:` line on stderr; a
-non-zero exit (e.g. a `401`) is classified as a failed reviewer, not a finding:
+`orchestrator.py` handles the parallelism: `run_reviewers_parallel` fans the
+three reviewers out on a thread pool with per-reviewer timeouts (Claude/Gemini
+300s, DeepSeek 600s for R1's reasoning phase) and a `reviewer status:` line on
+stderr; a non-zero exit (e.g. a `401`) is classified as a failed reviewer, not
+a finding. The prompt is piped in via stdin (never argv: 4000-line chunks
+would flirt with ARG_MAX).
+
+**Egress guard.** Reviewer containers hold live credentials while consuming
+untrusted diffs, so by default they join an internal Docker network
+(`advanced-review-egress`, no default route) and reach the outside only
+through an allowlisting squid proxy (`advanced-review-proxy`, image
+`ubuntu/squid`). The allowlist covers exactly the model API hosts
+(`EGRESS_ALLOWED_HOSTS` in `orchestrator.py`); CONNECT to any other host is
+denied, so an injected prompt cannot exfiltrate the mounted creds or API
+keys. Setup is idempotent and fails closed: if the guard cannot start, the
+review aborts (exit 4) rather than running open-network. Override with
+`--no-egress-guard`.
+
+The docker command below (Claude reviewer; Gemini and DeepSeek follow the
+same pattern with their own env keys and CLI flags) is reference
+documentation of what the orchestrator runs, not a command to launch by
+hand:
 
 ```bash
-docker run --rm \
+docker run --rm -i \
+  --network advanced-review-egress \
+  -e HTTPS_PROXY=http://advanced-review-proxy:3128 \
+  -e HTTP_PROXY=http://advanced-review-proxy:3128 \
+  -e NO_PROXY=localhost,127.0.0.1 \
   -v claude-reviewer-auth:/home/node/.claude:ro \
   -v "$PROJECT_ROOT:/workspace:ro" \
   claude-reviewer:latest --print --model opus \
-  "$(cat "$PROMPT_FILE")"
-```
-
-```bash
-docker run --rm \
-  -e GEMINI_API_KEY="$(cat ~/.config/gemini-api-key)" \
-  -v "$PROJECT_ROOT:/workspace:ro" \
-  gemini-reviewer:latest -p "$(cat "$PROMPT_FILE")" \
-  -m gemini-3.1-pro-preview --sandbox false --skip-trust
-```
-
-```bash
-docker run --rm \
-  -e DEEPSEEK_API_KEY="$(cat ~/.config/deepseek-api-key)" \
-  -v "$PROJECT_ROOT:/workspace:ro" \
-  deepseek-reviewer:latest \
-  --provider deepseek --model deepseek-reasoner \
-  -p -t read --no-session \
-  "$(cat "$PROMPT_FILE")"
+  < "$PROMPT_FILE"
 ```
 
 ### Step 3 — Deterministic validator
@@ -145,7 +164,9 @@ docker run --rm \
 1. **CWE existence**: `cwe_id` must exist in the MITRE CWE list (downloaded
    on first run, cached at `~/.cache/claude-advanced-review/cwe.json` with 30d
    TTL).
-2. **URL reachability**: `cwe_url` must return HTTP 200 (HEAD, 5s timeout).
+2. **URL reachability**: `cwe_url` must be `https://cwe.mitre.org/...`
+   (allowlist, no other host is ever fetched) and return HTTP 200
+   (HEAD, 5s timeout).
 3. **Test syntax**: `evidence.test` must parse as valid code in its declared
    language (Python `ast`, JS/TS via regex-level check, Go via `go/parser`,
    etc.).
@@ -159,9 +180,11 @@ transparency). Findings move forward with `validator_status: "passed"`.
 
 ### Step 4 — External test runner
 
-`runner/test-runner.sh` takes surviving `bug` findings and executes their
-proposed tests against the current codebase. The runner detects project
-toolchain by glob:
+`runner/test_runner.py` takes surviving `bug` findings and executes their
+proposed tests against the current codebase. Each proposed test runs inside an
+ephemeral, network-less Docker container (`--network none`) so untrusted
+reviewer-authored test code cannot touch the host or reach the network. The
+runner detects project toolchain by glob:
 
 | Marker file | Runner |
 |-------------|--------|
@@ -184,7 +207,7 @@ file doesn't exist.
 
 ### Step 5 — Semgrep (third reviewer, ground truth)
 
-`runner/semgrep-runner.sh` runs `semgrep/semgrep:latest` with `--config=auto`
+`runner/semgrep_runner.py` runs `semgrep/semgrep:latest` with `--config=auto`
 on the project. Output is parsed into the same finding schema used by the LLM
 reviewers. Semgrep findings are tagged `source: "semgrep"` and **skip the
 validator**: they are ground truth by construction.
@@ -197,12 +220,17 @@ Semgrep's role:
 
 Skip with `--no-semgrep`.
 
-### Step 5b — SonarQube (ground truth, persistent container)
+### Step 5b — SonarQube (opt-in ground truth, persistent container)
 
-`runner/sonarqube_runner.py` manages a persistent `sonarqube-review` Docker
-container running SonarQube Community Build. The container starts on first use
-(~60-120s cold start) and stays running for subsequent reviews (~10-30s per
-scan).
+**Opt-in: runs only with `--sonarqube`.** Skipped by default because it
+requires a persistent server container on port 9000 and two extra Docker
+images; on a machine without them the step would spend minutes pulling and
+booting SonarQube before contributing anything.
+
+When enabled, `runner/sonarqube_runner.py` manages a persistent
+`sonarqube-review` Docker container running SonarQube Community Build. The
+container starts on first use (~60-120s cold start) and stays running for
+subsequent reviews (~10-30s per scan).
 
 **Flow:**
 
@@ -236,8 +264,6 @@ scan).
 SonarQube findings are tagged `source: "sonarqube"` and are **ground truth**
 (bypass the validator). CRITICAL/WARNING findings enter the cross-check round 2
 where LLMs can dispute contextual relevance but not structural existence.
-
-Skip with `--no-sonarqube`.
 
 ### Step 6 — Round 2 cross-check (hostile defense)
 
@@ -317,6 +343,8 @@ The final report is markdown with sections by severity, each finding showing:
 | SonarQube port 9000 conflict | Stop conflicting service or change port in `sonarqube_runner.py` |
 | SonarQube token expired | Delete `~/.cache/claude-advanced-review/sonar-token` and rerun |
 | Claude auth fails | Re-login: `docker run -it --rm -v claude-reviewer-auth:/home/node/.claude --entrypoint bash claude-reviewer:latest -c "claude login"` |
+| Egress guard setup failed (exit 4) | Check Docker is running and `ubuntu/squid:latest` can be pulled; stale proxy: `docker rm -f advanced-review-proxy` and rerun. Last resort: `--no-egress-guard` (open network) |
+| Reviewer FAILED only with guard on | A CLI dependency needs a host missing from `EGRESS_ALLOWED_HOSTS` in `orchestrator.py`; add it there and rerun (the proxy is recreated automatically on allowlist change) |
 | Gemini API errors | Check `~/.config/gemini-api-key` exists and is valid |
 | Validator: "CWE list not found" | Delete `~/.cache/claude-advanced-review/cwe.json` and rerun (forces refresh) |
 | Test runner: "toolchain not detected" | Pass `--no-test-runner` to skip, or add a marker file the runner recognizes |

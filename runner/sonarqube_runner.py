@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -23,11 +24,18 @@ CONTAINER_NAME = "sonarqube-review"
 SONAR_PORT = 9000
 SONAR_URL = f"http://localhost:{SONAR_PORT}"
 
+# Inside the scanner container the SonarQube server (bound to the host's
+# loopback) is reachable via host.docker.internal on macOS Docker Desktop.
+# NOTE (Linux caveat): there host.docker.internal maps to the host gateway
+# IP, which a server bound to 127.0.0.1 will NOT answer; on Linux bind the
+# server to the gateway or point this at the host LAN IP instead.
+SCANNER_HOST_ALIAS = "host.docker.internal"
+
 CACHE_DIR = Path.home() / ".cache" / "claude-advanced-review"
 TOKEN_CACHE_PATH = CACHE_DIR / "sonar-token"
+ADMIN_PASS_PATH = CACHE_DIR / "sonar-admin-pass"
 
 DEFAULT_ADMIN_PASS = "admin"
-NEW_ADMIN_PASS = "reviewpass!2026"
 
 
 # ---------- Severity / category mapping ----------
@@ -76,6 +84,12 @@ def _container_running() -> bool:
     return proc.stdout.strip() == "true"
 
 
+def _ensure_private_cache_dir() -> None:
+    """Create CACHE_DIR (if missing) and lock it to owner-only (0700)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.chmod(0o700)
+
+
 # ---------- Container lifecycle ----------
 
 def ensure_running(timeout: int = 180) -> bool:
@@ -95,7 +109,9 @@ def ensure_running(timeout: int = 180) -> bool:
         subprocess.run(
             ["docker", "run", "-d",
              "--name", CONTAINER_NAME,
-             "-p", f"{SONAR_PORT}:9000",
+             # Bind to loopback only: the review server holds admin
+             # credentials and must not be reachable from the LAN.
+             "-p", f"127.0.0.1:{SONAR_PORT}:9000",
              "-e", "SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true",
              "-v", "sonarqube_review_data:/opt/sonarqube/data",
              "-v", "sonarqube_review_extensions:/opt/sonarqube/extensions",
@@ -148,14 +164,32 @@ def _ensure_token() -> str:
     resp.raise_for_status()
     token = resp.json()["token"]
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_private_cache_dir()
     TOKEN_CACHE_PATH.write_text(token)
+    TOKEN_CACHE_PATH.chmod(0o600)
     return token
 
 
+def _admin_password() -> str:
+    """Return this install's admin password, generating one on first use.
+
+    Persisted at ADMIN_PASS_PATH (0600, in a 0700 dir) so the credential is
+    unique per machine rather than a static secret shared via source control.
+    """
+    if ADMIN_PASS_PATH.exists():
+        existing = ADMIN_PASS_PATH.read_text().strip()
+        if existing:
+            return existing
+    pw = secrets.token_urlsafe(24)
+    _ensure_private_cache_dir()
+    ADMIN_PASS_PATH.write_text(pw)
+    ADMIN_PASS_PATH.chmod(0o600)
+    return pw
+
+
 def _working_admin_password() -> str:
-    """Determine which admin password works (new or default)."""
-    for pw in (NEW_ADMIN_PASS, DEFAULT_ADMIN_PASS):
+    """Determine which admin password works (persisted or default)."""
+    for pw in (_admin_password(), DEFAULT_ADMIN_PASS):
         try:
             resp = requests.get(
                 f"{SONAR_URL}/api/authentication/validate",
@@ -166,7 +200,7 @@ def _working_admin_password() -> str:
                 return pw
         except requests.exceptions.RequestException:
             continue
-    return NEW_ADMIN_PASS  # fallback
+    return _admin_password()  # fallback
 
 
 def _token_valid(token: str) -> bool:
@@ -189,7 +223,7 @@ def _change_default_password() -> None:
             data={
                 "login": "admin",
                 "previousPassword": DEFAULT_ADMIN_PASS,
-                "password": NEW_ADMIN_PASS,
+                "password": _admin_password(),
             },
             timeout=10,
         )
@@ -339,10 +373,17 @@ def run_scan(project_root: Path, project_key: str, token: str,
         "**/.claude/**,**/node_modules/**,**/dist/**,**/build/**,"
         "**/.next/**,**/.turbo/**,**/coverage/**"
     )
+    # `--network host` would expose every host-local service to a container
+    # that is ingesting the repo under review. Instead give the container a
+    # single route back to the host (host.docker.internal) and rewrite the
+    # loopback SonarQube URL to match. See SCANNER_HOST_ALIAS for the Linux
+    # caveat.
+    scanner_host_url = re.sub(r"//(localhost|127\.0\.0\.1)\b",
+                              f"//{SCANNER_HOST_ALIAS}", sonar_url)
     cmd = [
         "docker", "run", "--rm",
-        "--network", "host",
-        "-e", f"SONAR_HOST_URL={sonar_url}",
+        "--add-host", f"{SCANNER_HOST_ALIAS}:host-gateway",
+        "-e", f"SONAR_HOST_URL={scanner_host_url}",
         "-e", f"SONAR_TOKEN={token}",
         "-v", f"{project_root.resolve()}:/usr/src:ro",
         SCANNER_IMAGE,
@@ -402,7 +443,10 @@ def fetch_issues(project_key: str, token: str,
             )
             resp.raise_for_status()
             data = resp.json()
-        except (requests.exceptions.RequestException, Exception) as exc:
+        except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+            # Only the expected failure modes (network/HTTP errors, malformed
+            # JSON) collapse to "no findings". An unexpected exception is a
+            # bug we must not mask as a clean scan, so let it propagate.
             print(f"sonarqube: API error fetching issues: {exc}",
                   file=sys.stderr)
             return []
@@ -473,7 +517,9 @@ def cleanup_old_projects(token: str, sonar_url: str = SONAR_URL,
         )
         resp.raise_for_status()
         data = resp.json()
-    except (requests.exceptions.RequestException, Exception):
+    except (requests.exceptions.RequestException, ValueError, KeyError):
+        # Best-effort cleanup: swallow expected network/HTTP/JSON failures,
+        # but let an unexpected exception surface rather than hide a bug.
         return
 
     now = datetime.now(timezone.utc)

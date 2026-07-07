@@ -59,6 +59,16 @@ def classify_confidence(verdicts: list[dict | None]) -> str:
 _SEVERITY_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
 
 
+def _more_severe(a: str | None, b: str | None) -> str | None:
+    """Return whichever label is higher severity (CRITICAL > WARNING > INFO).
+
+    Unknown labels rank below INFO, so they never win over a known severity.
+    """
+    if _SEVERITY_ORDER.get(a, 99) <= _SEVERITY_ORDER.get(b, 99):
+        return a
+    return b
+
+
 def _finding_sort_key(f: dict) -> tuple:
     return (
         _SEVERITY_ORDER.get(f.get("severity", "INFO"), 99),
@@ -199,14 +209,24 @@ def annotate_with_verdicts(findings: list[dict],
         merged = {**f, "claude_verdict": cv, "gemini_verdict": gv,
                   "deepseek_verdict": dv, "confidence": confidence}
 
-        # MODIFY: surface the corrected severity/suggestion
+        # MODIFY: surface the corrected suggestion, and the corrected
+        # severity only when it is equal or HIGHER than the original. A
+        # round-2 verdict must never downgrade (e.g. CRITICAL -> INFO), which
+        # would silently suppress a finding; when several MODIFY verdicts
+        # disagree, the highest severity wins. The original is preserved as
+        # `original_severity` whenever we raise it.
+        original_severity = f.get("severity")
+        best_severity = original_severity
         for verdict in (cv, gv, dv):
             if verdict and verdict.get("verdict") == "MODIFY":
                 mod = verdict.get("modification", {}) or {}
                 if mod.get("severity"):
-                    merged["severity"] = mod["severity"]
+                    best_severity = _more_severe(best_severity, mod["severity"])
                 if mod.get("suggestion"):
                     merged["modified_suggestion"] = mod["suggestion"]
+        if best_severity != original_severity:
+            merged["severity"] = best_severity
+            merged["original_severity"] = original_severity
         out.append(merged)
     return out
 
