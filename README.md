@@ -40,13 +40,17 @@ This skill shifts the burden onto the reviewers:
 
 ## Status
 
-Work in progress. See `SKILL.md` for the skill loaded into Claude Code.
+Work in progress. See `SKILL.md` for the skill loaded into Claude Code. `SKILL.md` is loaded whole every time the skill activates, so material consulted rarely (the opt-in SonarQube step, full-repository mode, troubleshooting) lives under `references/` behind a one-line pointer and costs nothing until something needs it.
 
 ## Repo layout
 
 ```
 .
 ├── SKILL.md                    # Loaded by Claude Code as the user skill
+├── references/                 # Read on demand, not on every activation
+│   ├── repo-mode.md            # Full-repository mode (--repo) mechanics
+│   ├── sonarqube.md            # SonarQube setup, flow, severity mapping (--sonarqube)
+│   └── troubleshooting.md      # Docker, API keys, egress guard, validator errors
 ├── orchestrator.py             # Pipeline logic: preflight → diff/collect → round1 → validate → tests → semgrep → sonarqube (opt-in) → round2 → merge
 ├── orchestrator.sh             # Thin uv-run wrapper around orchestrator.py
 ├── prompts/
