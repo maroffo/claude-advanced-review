@@ -30,7 +30,109 @@ from merge import merger as MG  # noqa: E402
 
 CLAUDE_IMAGE = "claude-reviewer:latest"
 GEMINI_IMAGE = "gemini-reviewer:latest"
+DEEPSEEK_IMAGE = "deepseek-reviewer:latest"
 GEMINI_KEY_PATH = Path.home() / ".config" / "gemini-api-key"
+DEEPSEEK_KEY_PATH = Path.home() / ".config" / "deepseek-api-key"
+
+# deepseek-reasoner (R1) can spend several minutes reasoning before answering,
+# so it gets a longer wall-clock budget than the other two reviewers.
+CLAUDE_TIMEOUT = 300
+GEMINI_TIMEOUT = 300
+DEEPSEEK_TIMEOUT = 600
+
+# ---------- Egress guard ----------
+# Reviewer containers hold live credentials while consuming untrusted diffs.
+# By default they join an internal (no default route) Docker network and can
+# only reach the outside through an allowlisting HTTP proxy, so an injected
+# prompt cannot exfiltrate the mounted creds or API keys.
+EGRESS_NETWORK = "advanced-review-egress"
+EGRESS_PROXY_NAME = "advanced-review-proxy"
+EGRESS_PROXY_IMAGE = "ubuntu/squid:latest"
+EGRESS_PROXY_PORT = 3128
+EGRESS_CONF_PATH = (Path.home() / ".cache" / "claude-advanced-review"
+                    / "squid.conf")
+# Exact hosts only. A wildcard like .googleapis.com would reopen
+# storage.googleapis.com as an exfiltration channel.
+EGRESS_ALLOWED_HOSTS = (
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "console.anthropic.com",
+    "generativelanguage.googleapis.com",
+    "oauth2.googleapis.com",
+    "api.deepseek.com",
+)
+
+
+def _squid_conf() -> str:
+    hosts = " ".join(EGRESS_ALLOWED_HOSTS)
+    return (
+        f"http_port {EGRESS_PROXY_PORT}\n"
+        f"acl allowed dstdomain {hosts}\n"
+        "acl SSL_ports port 443\n"
+        "acl CONNECT method CONNECT\n"
+        "http_access deny CONNECT !SSL_ports\n"
+        "http_access allow allowed\n"
+        "http_access deny all\n"
+    )
+
+
+def _egress_args() -> list[str]:
+    proxy = f"http://{EGRESS_PROXY_NAME}:{EGRESS_PROXY_PORT}"
+    return [
+        "--network", EGRESS_NETWORK,
+        "-e", f"HTTPS_PROXY={proxy}",
+        "-e", f"HTTP_PROXY={proxy}",
+        "-e", "NO_PROXY=localhost,127.0.0.1",
+    ]
+
+
+def _docker(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker"] + args, capture_output=True,
+                          text=True, check=False, **kwargs)
+
+
+def ensure_egress_guard() -> bool:
+    """Idempotently set up the internal network and allowlist proxy.
+    Returns False on any setup failure; callers fail closed (abort the
+    review) rather than silently running reviewers with open egress."""
+    inspect = _docker(["network", "inspect", EGRESS_NETWORK])
+    if inspect.returncode != 0:
+        create = _docker(["network", "create", "--internal", EGRESS_NETWORK])
+        if create.returncode != 0:
+            print(f"egress guard: cannot create network: "
+                  f"{create.stderr.strip()}", file=sys.stderr)
+            return False
+
+    # Squid reads its config at container start (bind mount), so a changed
+    # allowlist requires recreating the proxy container.
+    conf = _squid_conf()
+    conf_changed = (not EGRESS_CONF_PATH.exists()
+                    or EGRESS_CONF_PATH.read_text() != conf)
+    if conf_changed:
+        EGRESS_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        EGRESS_CONF_PATH.write_text(conf)
+
+    running = _docker(["inspect", "-f", "{{.State.Running}}",
+                       EGRESS_PROXY_NAME])
+    proxy_up = running.returncode == 0 and running.stdout.strip() == "true"
+    if proxy_up and not conf_changed:
+        return True
+
+    _docker(["rm", "-f", EGRESS_PROXY_NAME])
+    run = _docker(["run", "-d", "--name", EGRESS_PROXY_NAME,
+                   "-v", f"{EGRESS_CONF_PATH}:/etc/squid/squid.conf:ro",
+                   EGRESS_PROXY_IMAGE])
+    if run.returncode != 0:
+        print(f"egress guard: cannot start proxy: {run.stderr.strip()}",
+              file=sys.stderr)
+        return False
+    connect = _docker(["network", "connect", EGRESS_NETWORK,
+                       EGRESS_PROXY_NAME])
+    if connect.returncode != 0 and "already exists" not in connect.stderr:
+        print(f"egress guard: cannot attach proxy to network: "
+              f"{connect.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
 
 
 def _read_gemini_key() -> str:
@@ -39,94 +141,220 @@ def _read_gemini_key() -> str:
     return GEMINI_KEY_PATH.read_text().strip()
 
 
+def _read_deepseek_key() -> str:
+    if not DEEPSEEK_KEY_PATH.exists():
+        raise SystemExit(f"missing {DEEPSEEK_KEY_PATH}")
+    return DEEPSEEK_KEY_PATH.read_text().strip()
+
+
+def _classify_failure(name: str, proc: subprocess.CompletedProcess,
+                      secret: str | None = None) -> None:
+    """Log why a reviewer produced no usable output. A non-zero exit is a
+    failure (auth, rate limit, crash), distinct from a clean empty answer.
+    Surfaces a re-login hint on auth failure so a stale token never degrades
+    silently. `secret` (the reviewer's API key, if any) is redacted from the
+    logged tail so a CLI that echoes it on error cannot leak it."""
+    blob = f"{proc.stdout}\n{proc.stderr}"
+    low = blob.lower()
+    is_auth = ("invalid authentication" in low or "unauthorized" in low
+               or ("401" in blob and "auth" in low))
+    if is_auth:
+        print(f"{name}: FAILED (auth expired/invalid; re-login the reviewer "
+              f"volume/key)", file=sys.stderr)
+        return
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    reason = tail[-1] if tail else "no output"
+    if secret:
+        reason = reason.replace(secret, "***")
+    print(f"{name}: FAILED (exit {proc.returncode}: {reason})",
+          file=sys.stderr)
+
+
 def run_claude(prompt_file: Path, project_root: Path,
-               timeout: int = 300) -> str:
-    cmd = [
-        "docker", "run", "--rm",
+               timeout: int = CLAUDE_TIMEOUT, egress: bool = True) -> str:
+    # Prompt goes in via stdin (`-i`), not argv: 4000-line chunks would
+    # otherwise flirt with ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
         "-v", "claude-reviewer-auth:/home/node/.claude:ro",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         CLAUDE_IMAGE, "--print", "--model", "opus",
-        prompt_file.read_text(),
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
-        return proc.stdout
+                              timeout=timeout,
+                              input=prompt_file.read_text())
     except subprocess.TimeoutExpired:
-        print(f"claude: timeout after {timeout}s", file=sys.stderr)
+        print(f"claude: FAILED (timeout after {timeout}s)", file=sys.stderr)
         return ""
+    if proc.returncode != 0:
+        _classify_failure("claude", proc)
+        return ""
+    return proc.stdout
 
 
 def run_gemini(prompt_file: Path, project_root: Path,
-               timeout: int = 300) -> str:
+               timeout: int = GEMINI_TIMEOUT, egress: bool = True) -> str:
     key = _read_gemini_key()
-    cmd = [
-        "docker", "run", "--rm",
-        "-e", f"GEMINI_API_KEY={key}",
+    # Pass the key by name only: Docker forwards the value from this process's
+    # environment, keeping the secret out of the container's argv (ps-visible).
+    # Prompt via stdin (`-i`, no `-p`): argv would flirt with ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
+        "-e", "GEMINI_API_KEY",
         "-v", f"{project_root.resolve()}:/workspace:ro",
         GEMINI_IMAGE,
-        "-p", prompt_file.read_text(),
         "-m", "gemini-3.1-pro-preview",
         "--sandbox", "false",
         "--skip-trust",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout)
-        # Strip known noisy lines from Gemini CLI
-        raw = proc.stdout
-        cleaned = "\n".join(
-            line for line in raw.splitlines()
-            if not line.startswith("[WARN] Skipping unreadable")
-            and not line.startswith("Warning: Could not read")
-        )
-        return cleaned
+                              timeout=timeout,
+                              input=prompt_file.read_text(),
+                              env={**os.environ, "GEMINI_API_KEY": key})
     except subprocess.TimeoutExpired:
-        print(f"gemini: timeout after {timeout}s", file=sys.stderr)
+        print(f"gemini: FAILED (timeout after {timeout}s)", file=sys.stderr)
         return ""
+    if proc.returncode != 0:
+        _classify_failure("gemini", proc, secret=key)
+        return ""
+    # Strip known noisy lines from Gemini CLI
+    cleaned = "\n".join(
+        line for line in proc.stdout.splitlines()
+        if not line.startswith("[WARN] Skipping unreadable")
+        and not line.startswith("Warning: Could not read")
+        and not line.startswith("[STARTUP]")
+    )
+    return cleaned
 
 
-def run_reviewers_parallel(prompt_file: Path,
-                           project_root: Path) -> tuple[str, str]:
-    with cf.ThreadPoolExecutor(max_workers=2) as pool:
-        f_claude = pool.submit(run_claude, prompt_file, project_root)
-        f_gemini = pool.submit(run_gemini, prompt_file, project_root)
-        return f_claude.result(), f_gemini.result()
+def run_deepseek(prompt_file: Path, project_root: Path,
+                 timeout: int = DEEPSEEK_TIMEOUT, egress: bool = True) -> str:
+    key = _read_deepseek_key()
+    # Pass the key by name only: Docker forwards the value from this process's
+    # environment, keeping the secret out of the container's argv (ps-visible).
+    # Prompt via stdin (`-i`, no positional arg): argv would flirt with
+    # ARG_MAX.
+    cmd = ["docker", "run", "--rm", "-i"]
+    if egress:
+        cmd += _egress_args()
+    cmd += [
+        "-e", "DEEPSEEK_API_KEY",
+        "-v", f"{project_root.resolve()}:/workspace:ro",
+        DEEPSEEK_IMAGE,
+        "--provider", "deepseek",
+        "--model", "deepseek-reasoner",
+        "-p", "-t", "read", "--no-session",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout,
+                              input=prompt_file.read_text(),
+                              env={**os.environ, "DEEPSEEK_API_KEY": key})
+    except subprocess.TimeoutExpired:
+        print(f"deepseek: FAILED (timeout after {timeout}s)", file=sys.stderr)
+        return ""
+    if proc.returncode != 0:
+        _classify_failure("deepseek", proc, secret=key)
+        return ""
+    return proc.stdout
+
+
+def run_reviewers_parallel(prompt_file: Path, project_root: Path,
+                           egress: bool = True) -> tuple[str, str, str]:
+    """Run all three reviewers concurrently. A reviewer that fails (timeout,
+    auth, crash) yields an empty string and is reported on stderr; the pipeline
+    degrades to the survivors rather than aborting."""
+    with cf.ThreadPoolExecutor(max_workers=3) as pool:
+        f_claude = pool.submit(run_claude, prompt_file, project_root,
+                               egress=egress)
+        f_gemini = pool.submit(run_gemini, prompt_file, project_root,
+                               egress=egress)
+        f_deepseek = pool.submit(run_deepseek, prompt_file, project_root,
+                                 egress=egress)
+        raw_claude = f_claude.result()
+        raw_gemini = f_gemini.result()
+        raw_deepseek = f_deepseek.result()
+    status = " | ".join(
+        f"{name} {'OK' if raw else 'FAILED'}"
+        for name, raw in (("claude", raw_claude), ("gemini", raw_gemini),
+                          ("deepseek", raw_deepseek))
+    )
+    print(f"reviewer status: {status}", file=sys.stderr)
+    return raw_claude, raw_gemini, raw_deepseek
+
+
+def _collect_verdicts(work_dir: Path, diff: Any | None, raw_claude: str,
+                      raw_gemini: str, raw_deepseek: str,
+                      ) -> tuple[dict[str, dict], dict[str, dict],
+                                 dict[str, dict]]:
+    """Parse round-2 verdicts for all three reviewers, persisting raw output
+    and verdicts to the work dir. Returns one finding_id -> verdict map per
+    reviewer (empty if that reviewer failed). When `diff` is provided (diff
+    mode) verdicts are validated against it; in repo mode there is no diff to
+    validate against, so `diff=None` takes the verdicts raw."""
+    results: list[dict[str, dict]] = []
+    for source, raw in (("claude", raw_claude), ("gemini", raw_gemini),
+                        ("deepseek", raw_deepseek)):
+        (work_dir / f"round2_{source}.txt").write_text(raw)
+        verdicts = extract_json(raw).get("verdicts", [])
+        if diff is not None:
+            verdicts = [V.validate_verdict(v, diff) for v in verdicts]
+        by_id = {v["finding_id"]: v for v in verdicts if v.get("finding_id")}
+        (work_dir / f"{source}_verdicts.json").write_text(
+            json.dumps({"verdicts": list(by_id.values())}, indent=2))
+        results.append(by_id)
+    return results[0], results[1], results[2]
 
 
 # ---------- JSON extraction from LLM output ----------
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
-_JSON_BARE_RE = re.compile(r"(\{[\s\S]*\})")
+
+
+def _first_json_object(text: str) -> dict[str, Any]:
+    """Decode the first complete JSON object starting at the first `{`.
+
+    Uses raw_decode rather than a greedy `{.*}` regex so that prose trailing
+    the object (e.g. '{"a": 1} and here is why...') doesn't break parsing."""
+    start = text.find("{")
+    if start == -1:
+        return {}
+    try:
+        return json.JSONDecoder().raw_decode(text, start)[0]
+    except json.JSONDecodeError:
+        return {}
 
 
 def extract_json(raw: str) -> dict[str, Any]:
-    """Extract the last JSON block from an LLM response."""
+    """Extract the last JSON object from an LLM response.
+
+    Prefers the last fenced ```json block; otherwise decodes the first
+    complete object in the raw text."""
     if not raw:
         return {}
     matches = list(_JSON_BLOCK_RE.finditer(raw))
     if matches:
         payload = matches[-1].group(1).strip()
-    else:
-        # Fallback: largest {...} blob
-        m = _JSON_BARE_RE.search(raw)
-        if not m:
-            return {}
-        payload = m.group(1)
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError:
-        # Last-ditch: trim to the first complete object
         try:
-            decoder = json.JSONDecoder()
-            return decoder.raw_decode(payload)[0]
+            return json.loads(payload)
         except json.JSONDecodeError:
-            return {}
+            return _first_json_object(payload)
+    return _first_json_object(raw)
 
 
 # ---------- Diff generation ----------
 
-def generate_diff(project_root: Path, mode: str, base: str) -> str:
+def generate_diff(project_root: Path, mode: str, base: str) -> str | None:
+    """Return the git diff for the given mode, or None if git itself failed.
+
+    None (git error) is distinct from "" (git succeeded, empty diff): the
+    caller exits 2 on the former and 1 on the latter."""
     git = ["git", "-C", str(project_root)]
     if mode == "staged":
         cmd = git + ["diff", "--cached"]
@@ -139,7 +367,7 @@ def generate_diff(project_root: Path, mode: str, base: str) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         print(f"git diff failed: {proc.stderr}", file=sys.stderr)
-        return ""
+        return None
     return proc.stdout
 
 
@@ -165,6 +393,148 @@ def build_prompt(template_path: Path, diff_text: str,
     return "\n".join(parts)
 
 
+# ---------- Shared pipeline stages ----------
+
+def _preflight_gate(project_root: Path, no_preflight: bool) -> int | None:
+    """Run the `make check` preflight. Returns 3 on failure (caller aborts),
+    or None to proceed. Messaging is identical in diff and repo modes."""
+    if no_preflight:
+        return None
+    if not PF.detect_check_target(project_root):
+        print("preflight: no make check target found, skipping "
+              "(run /project-checks to scaffold one)", file=sys.stderr)
+        return None
+    print("preflight: running make check...", file=sys.stderr)
+    pf = PF.run_preflight(project_root)
+    if not pf.passed:
+        print("preflight: FAILED. Fix before review.\n", file=sys.stderr)
+        print(pf.output, file=sys.stderr)
+        return 3
+    print("preflight: passed", file=sys.stderr)
+    return None
+
+
+def _egress_gate(args: argparse.Namespace) -> int | None:
+    """Bring up the egress guard before any reviewer runs. Returns 4 on
+    failure (caller aborts: fail closed, never silently open-network), or
+    None to proceed."""
+    if args.no_egress_guard:
+        print("egress guard: DISABLED (--no-egress-guard); reviewers run "
+              "with open network", file=sys.stderr)
+        return None
+    if not ensure_egress_guard():
+        print("egress guard: setup failed; refusing to run reviewers with "
+              "open egress (override with --no-egress-guard)",
+              file=sys.stderr)
+        return 4
+    return None
+
+
+def _parse_findings(raws: tuple[tuple[str, str, str], ...],
+                    make_id) -> list[dict]:
+    """Parse each reviewer's JSON and stamp a deterministic, source-prefixed
+    id over whatever the LLM emitted. `raws` is a tuple of (source, raw_text,
+    prefix); `make_id(prefix, seq)` builds the id from the finding's 0-based
+    position. Any LLM-supplied id is always overwritten (two reviewers can
+    emit the same id, which would collide during verdict attribution) but
+    preserved as `original_id`."""
+    findings: list[dict] = []
+    for source, raw, prefix in raws:
+        out = extract_json(raw) or {"findings": []}
+        for f in out.get("findings", []):
+            if "id" in f:
+                f["original_id"] = f["id"]
+            f["id"] = make_id(prefix, len(findings))
+            f["source"] = source
+            findings.append(f)
+    return findings
+
+
+def _run_semgrep_stage(no_semgrep: bool, scan_root: Path,
+                       work_dir: Path | None = None,
+                       targets: list[str] | None = None) -> list[dict]:
+    """Run Semgrep against `scan_root` (the --repo subpath in repo mode, the
+    project root in diff mode) and map to the finding schema. Diff mode
+    passes the diff's files as `targets` so only they are scanned. Persists
+    semgrep.json only when `work_dir` is given (diff mode)."""
+    if no_semgrep:
+        return []
+    print("semgrep: running...", file=sys.stderr)
+    raw = SR.run_semgrep(scan_root, targets=targets)
+    findings = SR.parse_output(raw)
+    if work_dir is not None:
+        (work_dir / "semgrep.json").write_text(
+            json.dumps({"findings": findings}, indent=2))
+    print(f"semgrep: {len(findings)} findings", file=sys.stderr)
+    return findings
+
+
+def _run_sonarqube_stage(args: argparse.Namespace, project_root: Path,
+                         diff_mode: str | None,
+                         work_dir: Path | None = None) -> list[dict]:
+    """Run the opt-in SonarQube ground-truth reviewer. `diff_mode` scopes the
+    scan to a diff in diff mode; repo mode passes None for a full-repo scan.
+    Persists sonarqube.json only when `work_dir` is given (diff mode)."""
+    if not args.sonarqube:
+        print("sonarqube: skipped (opt-in; pass --sonarqube to enable)",
+              file=sys.stderr)
+        return []
+    print("sonarqube: running...", file=sys.stderr)
+    findings = SQ.run_sonarqube(project_root, diff_mode=diff_mode,
+                                base_ref=args.base)
+    if work_dir is not None:
+        (work_dir / "sonarqube.json").write_text(
+            json.dumps({"findings": findings}, indent=2))
+    print(f"sonarqube: {len(findings)} findings", file=sys.stderr)
+    return findings
+
+
+def _run_cross_check(work_dir: Path, prompt_name: str,
+                     cw_findings: list[dict], context_text: str,
+                     diff: Any | None, project_root: Path,
+                     no_cross_check: bool, egress: bool = True,
+                     ) -> tuple[dict[str, dict], dict[str, dict],
+                                dict[str, dict]]:
+    """Hostile round-2 cross-check: build the prompt over CRITICAL/WARNING
+    findings, run all reviewers, collect their verdicts. Returns three empty
+    maps when there is nothing to cross-check or it's disabled. `diff` is the
+    parsed diff for verdict validation (None in repo mode, where there is no
+    diff)."""
+    if not cw_findings or no_cross_check:
+        return {}, {}, {}
+    cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
+    cross_prompt = build_prompt(cross_prompt_path, context_text,
+                                findings=cw_findings)
+    (work_dir / prompt_name).write_text(cross_prompt)
+    print(f"round 2: cross-check on {len(cw_findings)} findings...",
+          file=sys.stderr)
+    raw_c2 = run_reviewers_parallel(work_dir / prompt_name, project_root,
+                                    egress=egress)
+    return _collect_verdicts(work_dir, diff, *raw_c2)
+
+
+def _write_report(work_dir: Path, report_findings: list[dict],
+                  semgrep_findings: list[dict], sonar_findings: list[dict],
+                  review_tests_dir: Path | None = None) -> int:
+    """Build the merged report.md/report.json and print their paths. Returns
+    0. In diff mode `review_tests_dir` surfaces the generated red-green tests."""
+    report_md = MG.build_report(report_findings,
+                                semgrep_findings=semgrep_findings,
+                                sonar_findings=sonar_findings)
+    out_md = work_dir / "report.md"
+    out_json = work_dir / "report.json"
+    out_md.write_text(report_md)
+    out_json.write_text(json.dumps(
+        {"findings": report_findings + semgrep_findings + sonar_findings},
+        indent=2))
+    print(f"\nReport: {out_md}")
+    print(f"JSON:   {out_json}")
+    if (review_tests_dir is not None and review_tests_dir.exists()
+            and any(review_tests_dir.iterdir())):
+        print(f"Tests:  {review_tests_dir}")
+    return 0
+
+
 # ---------- Main pipeline ----------
 
 def pipeline(args: argparse.Namespace) -> int:
@@ -174,23 +544,14 @@ def pipeline(args: argparse.Namespace) -> int:
         return 2
 
     # 0) Pre-flight: make check
-    if not args.no_preflight:
-        if PF.detect_check_target(project_root):
-            print("preflight: running make check...", file=sys.stderr)
-            pf = PF.run_preflight(project_root)
-            if not pf.passed:
-                print("preflight: FAILED. Fix before review.\n",
-                      file=sys.stderr)
-                print(pf.output, file=sys.stderr)
-                return 3
-            print("preflight: passed", file=sys.stderr)
-        else:
-            print("preflight: no make check target found, skipping "
-                  "(run /project-checks to scaffold one)",
-                  file=sys.stderr)
+    rc = _preflight_gate(project_root, args.no_preflight)
+    if rc is not None:
+        return rc
 
     # 1) Diff
     diff_text = generate_diff(project_root, args.diff_mode, args.base)
+    if diff_text is None:
+        return 2
     if not diff_text.strip():
         print("empty diff; nothing to review (hint: --all or --branch)",
               file=sys.stderr)
@@ -208,25 +569,24 @@ def pipeline(args: argparse.Namespace) -> int:
     round1_prompt = build_prompt(prompt_path, diff_text)
     (work_dir / "round1_prompt.md").write_text(round1_prompt)
 
+    # Egress guard just before any reviewer runs (fail closed).
+    rc = _egress_gate(args)
+    if rc is not None:
+        return rc
+
     print("round 1: running reviewers...", file=sys.stderr)
-    raw_claude, raw_gemini = run_reviewers_parallel(
+    raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
         work_dir / "round1_prompt.md", project_root,
+        egress=not args.no_egress_guard,
     )
     (work_dir / "round1_claude.txt").write_text(raw_claude)
     (work_dir / "round1_gemini.txt").write_text(raw_gemini)
+    (work_dir / "round1_deepseek.txt").write_text(raw_deepseek)
 
-    claude_out = extract_json(raw_claude) or {"findings": []}
-    gemini_out = extract_json(raw_gemini) or {"findings": []}
-
-    findings: list[dict] = []
-    for f in claude_out.get("findings", []):
-        f.setdefault("id", f"c-{len(findings)+1}")
-        f["source"] = "claude"
-        findings.append(f)
-    for f in gemini_out.get("findings", []):
-        f.setdefault("id", f"g-{len(findings)+1}")
-        f["source"] = "gemini"
-        findings.append(f)
+    findings = _parse_findings(
+        (("claude", raw_claude, "c"), ("gemini", raw_gemini, "g"),
+         ("deepseek", raw_deepseek, "d")),
+        lambda prefix, seq: f"{prefix}-{seq + 1}")
     print(f"round 1: {len(findings)} raw findings", file=sys.stderr)
 
     # 3) Validator
@@ -266,30 +626,15 @@ def pipeline(args: argparse.Namespace) -> int:
     print(f"after test runner: {len(surviving)} surviving", file=sys.stderr)
 
     # 5) Semgrep (parallel with step 4 in a follow-up; sequential for v1)
-    semgrep_findings: list[dict] = []
-    if not args.no_semgrep:
-        print("semgrep: running...", file=sys.stderr)
-        raw = SR.run_semgrep(
-            project_root,
-            targets=SQ.changed_paths(project_root, args.diff_mode, args.base),
-        )
-        semgrep_findings = SR.parse_output(raw)
-        (work_dir / "semgrep.json").write_text(
-            json.dumps({"findings": semgrep_findings}, indent=2))
-        print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
+    semgrep_findings = _run_semgrep_stage(
+        args.no_semgrep, project_root, work_dir,
+        targets=SQ.changed_paths(project_root, args.diff_mode, args.base),
+    )
 
-    # 5b) SonarQube (ground truth, persistent container)
-    sonar_findings: list[dict] = []
-    if not args.no_sonarqube:
-        print("sonarqube: running...", file=sys.stderr)
-        sonar_findings = SQ.run_sonarqube(
-            project_root,
-            diff_mode=args.diff_mode,
-            base_ref=args.base,
-        )
-        (work_dir / "sonarqube.json").write_text(
-            json.dumps({"findings": sonar_findings}, indent=2))
-        print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+    # 5b) SonarQube (opt-in ground truth, persistent container)
+    sonar_findings = _run_sonarqube_stage(args, project_root,
+                                          diff_mode=args.diff_mode,
+                                          work_dir=work_dir)
 
     # 6) Cross-check round 2
     # Include CRITICAL/WARNING from LLM surviving + SonarQube ground truth
@@ -298,58 +643,24 @@ def pipeline(args: argparse.Namespace) -> int:
     cw_findings = [f for f in surviving
                    if f.get("severity") in ("CRITICAL", "WARNING")]
     cw_findings.extend(sonar_cw)
-    claude_verdicts: dict[str, dict] = {}
-    gemini_verdicts: dict[str, dict] = {}
-
-    if cw_findings and not args.no_cross_check:
-        cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
-        cross_prompt = build_prompt(cross_prompt_path, diff_text,
-                                    findings=cw_findings)
-        (work_dir / "round2_prompt.md").write_text(cross_prompt)
-        print(f"round 2: cross-check on {len(cw_findings)} findings...",
-              file=sys.stderr)
-        raw_c2_claude, raw_c2_gemini = run_reviewers_parallel(
-            work_dir / "round2_prompt.md", project_root,
-        )
-        (work_dir / "round2_claude.txt").write_text(raw_c2_claude)
-        (work_dir / "round2_gemini.txt").write_text(raw_c2_gemini)
-
-        vc = extract_json(raw_c2_claude).get("verdicts", [])
-        vg = extract_json(raw_c2_gemini).get("verdicts", [])
-        vc = [V.validate_verdict(v, diff) for v in vc]
-        vg = [V.validate_verdict(v, diff) for v in vg]
-        claude_verdicts = {v["finding_id"]: v for v in vc
-                           if v.get("finding_id")}
-        gemini_verdicts = {v["finding_id"]: v for v in vg
-                           if v.get("finding_id")}
-        (work_dir / "claude_verdicts.json").write_text(
-            json.dumps({"verdicts": list(claude_verdicts.values())}, indent=2))
-        (work_dir / "gemini_verdicts.json").write_text(
-            json.dumps({"verdicts": list(gemini_verdicts.values())}, indent=2))
+    claude_verdicts, gemini_verdicts, deepseek_verdicts = _run_cross_check(
+        work_dir, "round2_prompt.md", cw_findings, diff_text, diff,
+        project_root, args.no_cross_check,
+        egress=not args.no_egress_guard)
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(surviving, claude_verdicts,
-                                          gemini_verdicts)
+                                          gemini_verdicts, deepseek_verdicts)
     # SonarQube CRITICAL/WARNING that went through cross-check get verdicts too
     sonar_annotated = MG.annotate_with_verdicts(sonar_cw, claude_verdicts,
-                                                gemini_verdicts)
+                                                gemini_verdicts,
+                                                deepseek_verdicts)
     sonar_info = [f for f in sonar_findings
                   if f.get("severity") not in ("CRITICAL", "WARNING")]
     all_sonar = sonar_annotated + sonar_info
 
-    report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings,
-                                sonar_findings=all_sonar)
-    out_md = work_dir / "report.md"
-    out_json = work_dir / "report.json"
-    out_md.write_text(report_md)
-    out_json.write_text(json.dumps(
-        {"findings": annotated + semgrep_findings + all_sonar}, indent=2))
-
-    print(f"\nReport: {out_md}")
-    print(f"JSON:   {out_json}")
-    if review_tests_dir.exists() and any(review_tests_dir.iterdir()):
-        print(f"Tests:  {review_tests_dir}")
-    return 0
+    return _write_report(work_dir, annotated, semgrep_findings, all_sonar,
+                         review_tests_dir)
 
 
 # ---------- CLI ----------
@@ -371,9 +682,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         choices=("default", "ci-style", "repo-review"))
     parser.add_argument("--no-preflight", action="store_true")
     parser.add_argument("--no-semgrep", action="store_true")
-    parser.add_argument("--no-sonarqube", action="store_true")
+    parser.add_argument("--sonarqube", action="store_true",
+                        help="Run the SonarQube ground-truth reviewer "
+                             "(opt-in: needs Docker images and a persistent "
+                             "container on port 9000)")
     parser.add_argument("--no-cross-check", action="store_true")
     parser.add_argument("--no-test-runner", action="store_true")
+    parser.add_argument("--no-egress-guard", action="store_true",
+                        help="Run reviewers with open network instead of "
+                             "the internal network + allowlist proxy "
+                             "(weakens exfiltration protection)")
     args = parser.parse_args(argv)
     if args.base is not None:
         args.diff_mode = "branch"
@@ -394,16 +712,9 @@ def pipeline_repo(args: argparse.Namespace) -> int:
         return 2
 
     # 0) Pre-flight
-    if not args.no_preflight:
-        if PF.detect_check_target(project_root):
-            print("preflight: running make check...", file=sys.stderr)
-            pf = PF.run_preflight(project_root)
-            if not pf.passed:
-                print("preflight: FAILED. Fix before review.\n",
-                      file=sys.stderr)
-                print(pf.output, file=sys.stderr)
-                return 3
-            print("preflight: passed", file=sys.stderr)
+    rc = _preflight_gate(project_root, args.no_preflight)
+    if rc is not None:
+        return rc
 
     work_dir = Path(tempfile.mkdtemp(prefix="advanced-review-repo-"))
     print(f"work_dir: {work_dir}", file=sys.stderr)
@@ -424,7 +735,16 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     chunks = RC.chunk_by_directory(files)
     print(f"repo: {len(chunks)} chunks", file=sys.stderr)
 
-    # 3) LLM review per chunk
+    # Egress guard just before any reviewer runs (fail closed).
+    rc = _egress_gate(args)
+    if rc is not None:
+        return rc
+
+    # 3) LLM review per chunk.
+    # Repo mode always uses repo-review.md and ignores --prompt on purpose:
+    # only this template carries the {{SKELETON}}/{{FILES}} placeholders that
+    # the per-chunk injection below fills. default.md / ci-style.md lack them,
+    # so honoring --prompt here would silently review empty chunks.
     prompt_path = REPO_ROOT / "prompts" / "repo-review.md"
     prompt_template = prompt_path.read_text()
     cwe = V.CWEStore()
@@ -455,23 +775,16 @@ def pipeline_repo(args: argparse.Namespace) -> int:
         prompt_file.write_text(prompt_text)
 
         # Run reviewers
-        raw_claude, raw_gemini = run_reviewers_parallel(prompt_file,
-                                                         project_root)
+        raw_claude, raw_gemini, raw_deepseek = run_reviewers_parallel(
+            prompt_file, project_root, egress=not args.no_egress_guard)
         (work_dir / f"chunk_{i}_claude.txt").write_text(raw_claude)
         (work_dir / f"chunk_{i}_gemini.txt").write_text(raw_gemini)
+        (work_dir / f"chunk_{i}_deepseek.txt").write_text(raw_deepseek)
 
-        claude_out = extract_json(raw_claude) or {"findings": []}
-        gemini_out = extract_json(raw_gemini) or {"findings": []}
-
-        chunk_findings: list[dict] = []
-        for f in claude_out.get("findings", []):
-            f.setdefault("id", f"c-{i}-{len(chunk_findings)+1}")
-            f["source"] = "claude"
-            chunk_findings.append(f)
-        for f in gemini_out.get("findings", []):
-            f.setdefault("id", f"g-{i}-{len(chunk_findings)+1}")
-            f["source"] = "gemini"
-            chunk_findings.append(f)
+        chunk_findings = _parse_findings(
+            (("claude", raw_claude, "c"), ("gemini", raw_gemini, "g"),
+             ("deepseek", raw_deepseek, "d")),
+            lambda prefix, seq, i=i: f"{prefix}-{i}-{seq + 1}")
 
         # Validate (repo mode: check file/line existence, no diff)
         validated = [V.validate_finding_repo(f, project_root, cwe)
@@ -488,34 +801,23 @@ def pipeline_repo(args: argparse.Namespace) -> int:
     print(f"repo: dedup {before_dedup} -> {len(all_findings)}",
           file=sys.stderr)
 
-    # 5) Semgrep
-    semgrep_findings: list[dict] = []
-    if not args.no_semgrep:
-        print("semgrep: running...", file=sys.stderr)
-        raw = SR.run_semgrep(project_root)
-        semgrep_findings = SR.parse_output(raw)
-        print(f"semgrep: {len(semgrep_findings)} findings", file=sys.stderr)
+    # 5) Semgrep (scoped to the --repo subpath, if narrower than the root)
+    semgrep_findings = _run_semgrep_stage(args.no_semgrep, repo_path)
 
-    # 5b) SonarQube
-    sonar_findings: list[dict] = []
-    if not args.no_sonarqube:
-        print("sonarqube: running...", file=sys.stderr)
-        sonar_findings = SQ.run_sonarqube(
-            project_root,
-            diff_mode=args.diff_mode,
-            base_ref=args.base,
-        )
-        print(f"sonarqube: {len(sonar_findings)} findings", file=sys.stderr)
+    # 5b) SonarQube (opt-in). Repo mode is a full-repo review, so the scan is
+    # NOT scoped to a diff (diff_mode=None); SonarQube also can't scope to a
+    # --repo subpath narrower than project_root, so warn when one was given.
+    if args.sonarqube and repo_path != project_root:
+        print("sonarqube: scanning full repo (path scoping not supported)",
+              file=sys.stderr)
+    sonar_findings = _run_sonarqube_stage(args, project_root, diff_mode=None)
 
     # 6) Cross-check on CRITICAL/WARNING
     cw_findings = [f for f in all_findings
                    if f.get("severity") in ("CRITICAL", "WARNING")]
-    claude_verdicts: dict[str, dict] = {}
-    gemini_verdicts: dict[str, dict] = {}
-
+    # Build a pseudo-diff context from file contents (repo mode has no diff).
+    file_context = ""
     if cw_findings and not args.no_cross_check:
-        cross_prompt_path = REPO_ROOT / "prompts" / "cross-check.md"
-        # Build a pseudo-diff context from file contents for cross-check
         cross_files = {f.get("file", "") for f in cw_findings}
         file_ctx = []
         for fp in cross_files:
@@ -526,33 +828,16 @@ def pipeline_repo(args: argparse.Namespace) -> int:
                 except OSError:
                     pass
         file_context = "\n\n".join(file_ctx)
-        cross_prompt = build_prompt(cross_prompt_path, file_context,
-                                    findings=cw_findings)
-        (work_dir / "cross_check_prompt.md").write_text(cross_prompt)
-        print(f"round 2: cross-check on {len(cw_findings)} findings...",
-              file=sys.stderr)
-        raw_c2_claude, raw_c2_gemini = run_reviewers_parallel(
-            work_dir / "cross_check_prompt.md", project_root,
-        )
-        vc = extract_json(raw_c2_claude).get("verdicts", [])
-        vg = extract_json(raw_c2_gemini).get("verdicts", [])
-        claude_verdicts = {v["finding_id"]: v for v in vc if v.get("finding_id")}
-        gemini_verdicts = {v["finding_id"]: v for v in vg if v.get("finding_id")}
+    # Repo mode has no diff, so verdicts are taken raw (diff=None).
+    claude_verdicts, gemini_verdicts, deepseek_verdicts = _run_cross_check(
+        work_dir, "cross_check_prompt.md", cw_findings, file_context, None,
+        project_root, args.no_cross_check,
+        egress=not args.no_egress_guard)
 
     # 7) Merge
     annotated = MG.annotate_with_verdicts(all_findings, claude_verdicts,
-                                          gemini_verdicts)
-    report_md = MG.build_report(annotated, semgrep_findings=semgrep_findings,
-                                sonar_findings=sonar_findings)
-    out_md = work_dir / "report.md"
-    out_json = work_dir / "report.json"
-    out_md.write_text(report_md)
-    out_json.write_text(json.dumps(
-        {"findings": annotated + semgrep_findings + sonar_findings}, indent=2))
-
-    print(f"\nReport: {out_md}")
-    print(f"JSON:   {out_json}")
-    return 0
+                                          gemini_verdicts, deepseek_verdicts)
+    return _write_report(work_dir, annotated, semgrep_findings, sonar_findings)
 
 
 def main(argv: list[str] | None = None) -> int:

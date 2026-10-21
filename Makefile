@@ -1,7 +1,7 @@
 # Python checks (via uv)
 UV ?= uv
 
-.PHONY: check lint typecheck vuln test test-e2e
+.PHONY: check lint vuln test test-e2e
 
 check: lint vuln test
 

@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import time
+import urllib.parse
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -27,6 +28,11 @@ CWE_CACHE_PATH = CACHE_DIR / "cwe.json"
 CWE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 MITRE_CWE_XML_ZIP_URL = "https://cwe.mitre.org/data/xml/cwec_latest.xml.zip"
 URL_TIMEOUT = 5.0
+
+# CWE reference URLs are supplied by the (untrusted) LLM reviewer, so the
+# reachability check is an SSRF sink (CWE-918). Restrict it to the one host
+# a legitimate CWE citation can point at.
+_ALLOWED_CWE_HOST = "cwe.mitre.org"
 
 # Identifiers so generic they don't count as evidence of relevance.
 # Uppercase SQL keywords covered separately via the "all-uppercase short" filter.
@@ -141,7 +147,31 @@ def _download_cwe_list() -> dict[str, str]:
 
 # ---------- URL check ----------
 
+def _is_allowed_cwe_url(url: Any) -> bool:
+    """True only for https URLs whose host is exactly cwe.mitre.org.
+
+    Rejects other schemes, other hosts, and userinfo tricks
+    (e.g. ``https://cwe.mitre.org@attacker.internal/``) that would otherwise
+    let a crafted cwe_url reach an internal service.
+    """
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    if parsed.username or parsed.password:
+        return False
+    return parsed.hostname == _ALLOWED_CWE_HOST
+
+
 def url_reachable(url: str, timeout: float = URL_TIMEOUT) -> bool:
+    # Guard the request itself: a URL outside the allowlist never gets fetched
+    # and is reported unreachable, the same path a dead CWE link takes today.
+    if not _is_allowed_cwe_url(url):
+        return False
     try:
         resp = requests.head(url, timeout=timeout, allow_redirects=True)
         return 200 <= resp.status_code < 400

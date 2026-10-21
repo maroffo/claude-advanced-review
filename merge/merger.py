@@ -19,32 +19,36 @@ def _effective_verdict(v: dict | None) -> str | None:
     return v.get("verdict")
 
 
-def classify_confidence(claude_verdict: dict | None,
-                        gemini_verdict: dict | None) -> str:
-    """Apply the merge matrix from SKILL.md step 7.
+def classify_confidence(verdicts: list[dict | None]) -> str:
+    """Apply the three-reviewer (Claude + Gemini + DeepSeek) majority matrix.
+
+    Decided on the verdicts actually present, so one failed reviewer does not
+    nuke all confidence (graceful degradation). A majority needs at least two
+    present verdicts.
 
     | Outcome | Tag |
     |---------|-----|
-    | both ACCEPT | HIGH_CONFIDENCE |
-    | one ACCEPT + one MODIFY (or both MODIFY) | MODIFIED |
-    | any REJECT-WITH-COUNTER-EVIDENCE | DISPUTED |
-    | any validated REFUTE-BY-EXPLANATION | DISPUTED |
-    | any missing verdict | UNVERIFIED |
+    | fewer than 2 verdicts present | UNVERIFIED |
+    | any REJECT-WITH-COUNTER-EVIDENCE / validated REFUTE-BY-EXPLANATION | DISPUTED |
+    | >= 2 ACCEPT | HIGH_CONFIDENCE |
+    | at least one MODIFY (and not enough ACCEPT) | MODIFIED |
+    | otherwise | UNVERIFIED |
     """
-    cv = _effective_verdict(claude_verdict)
-    gv = _effective_verdict(gemini_verdict)
-
-    if cv is None or gv is None:
+    present = [ev for ev in (_effective_verdict(v) for v in verdicts)
+               if ev is not None]
+    if len(present) < 2:
         return "UNVERIFIED"
 
     disputed = {"REJECT-WITH-COUNTER-EVIDENCE", "REFUTE-BY-EXPLANATION"}
-    if cv in disputed or gv in disputed:
+    if any(ev in disputed for ev in present):
         return "DISPUTED"
 
-    if cv == "ACCEPT" and gv == "ACCEPT":
+    # ACCEPT majority wins even if a third reviewer said MODIFY.
+    if present.count("ACCEPT") >= 2:
         return "HIGH_CONFIDENCE"
 
-    if "MODIFY" in (cv, gv):
+    # No ACCEPT majority: any reviewer wanting changes tags it MODIFIED.
+    if "MODIFY" in present:
         return "MODIFIED"
 
     return "UNVERIFIED"
@@ -53,6 +57,16 @@ def classify_confidence(claude_verdict: dict | None,
 # ---------- Report rendering ----------
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+
+
+def _more_severe(a: str | None, b: str | None) -> str | None:
+    """Return whichever label is higher severity (CRITICAL > WARNING > INFO).
+
+    Unknown labels rank below INFO, so they never win over a known severity.
+    """
+    if _SEVERITY_ORDER.get(a, 99) <= _SEVERITY_ORDER.get(b, 99):
+        return a
+    return b
 
 
 def _finding_sort_key(f: dict) -> tuple:
@@ -135,10 +149,12 @@ def _render_finding(f: dict, source_override: str | None = None) -> list[str]:
 
     cv = f.get("claude_verdict")
     gv = f.get("gemini_verdict")
-    if cv or gv:
+    dv = f.get("deepseek_verdict")
+    if cv or gv or dv:
         out.append(f"- **Cross-check:** "
                    f"claude={_effective_verdict(cv) or '—'}, "
-                   f"gemini={_effective_verdict(gv) or '—'}")
+                   f"gemini={_effective_verdict(gv) or '—'}, "
+                   f"deepseek={_effective_verdict(dv) or '—'}")
 
     out.append("")
     return out
@@ -179,24 +195,38 @@ def deduplicate_findings(findings: list[dict]) -> list[dict]:
 
 def annotate_with_verdicts(findings: list[dict],
                            claude_verdicts: dict[str, dict],
-                           gemini_verdicts: dict[str, dict]) -> list[dict]:
+                           gemini_verdicts: dict[str, dict],
+                           deepseek_verdicts: dict[str, dict] | None = None,
+                           ) -> list[dict]:
+    deepseek_verdicts = deepseek_verdicts or {}
     out: list[dict] = []
     for f in findings:
         fid = f.get("id")
         cv = claude_verdicts.get(fid)
         gv = gemini_verdicts.get(fid)
-        confidence = classify_confidence(cv, gv)
+        dv = deepseek_verdicts.get(fid)
+        confidence = classify_confidence([cv, gv, dv])
         merged = {**f, "claude_verdict": cv, "gemini_verdict": gv,
-                  "confidence": confidence}
+                  "deepseek_verdict": dv, "confidence": confidence}
 
-        # MODIFY: surface the corrected severity/suggestion
-        for verdict in (cv, gv):
+        # MODIFY: surface the corrected suggestion, and the corrected
+        # severity only when it is equal or HIGHER than the original. A
+        # round-2 verdict must never downgrade (e.g. CRITICAL -> INFO), which
+        # would silently suppress a finding; when several MODIFY verdicts
+        # disagree, the highest severity wins. The original is preserved as
+        # `original_severity` whenever we raise it.
+        original_severity = f.get("severity")
+        best_severity = original_severity
+        for verdict in (cv, gv, dv):
             if verdict and verdict.get("verdict") == "MODIFY":
                 mod = verdict.get("modification", {}) or {}
                 if mod.get("severity"):
-                    merged["severity"] = mod["severity"]
+                    best_severity = _more_severe(best_severity, mod["severity"])
                 if mod.get("suggestion"):
                     merged["modified_suggestion"] = mod["suggestion"]
+        if best_severity != original_severity:
+            merged["severity"] = best_severity
+            merged["original_severity"] = original_severity
         out.append(merged)
     return out
 
@@ -208,6 +238,7 @@ def _main() -> int:
     parser.add_argument("--findings", type=Path, required=True)
     parser.add_argument("--claude-verdicts", type=Path)
     parser.add_argument("--gemini-verdicts", type=Path)
+    parser.add_argument("--deepseek-verdicts", type=Path)
     parser.add_argument("--semgrep", type=Path)
     parser.add_argument("--sonarqube", type=Path)
     parser.add_argument("--out-md", type=Path, required=True)
@@ -225,6 +256,7 @@ def _main() -> int:
 
     claude_verdicts = _load_verdicts(args.claude_verdicts)
     gemini_verdicts = _load_verdicts(args.gemini_verdicts)
+    deepseek_verdicts = _load_verdicts(args.deepseek_verdicts)
     semgrep = []
     if args.semgrep and args.semgrep.exists():
         semgrep = json.loads(args.semgrep.read_text()).get("findings", [])
@@ -232,7 +264,8 @@ def _main() -> int:
     if args.sonarqube and args.sonarqube.exists():
         sonar = json.loads(args.sonarqube.read_text()).get("findings", [])
 
-    annotated = annotate_with_verdicts(findings, claude_verdicts, gemini_verdicts)
+    annotated = annotate_with_verdicts(findings, claude_verdicts,
+                                       gemini_verdicts, deepseek_verdicts)
     merged_all = annotated + semgrep + sonar
 
     args.out_md.write_text(build_report(annotated, semgrep_findings=semgrep,

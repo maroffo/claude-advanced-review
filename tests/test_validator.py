@@ -77,27 +77,60 @@ class TestCWEExists:
 
 # ---------- URL reachability ----------
 
+_CWE_URL = "https://cwe.mitre.org/data/definitions/89.html"
+
+
 class TestURLReachable:
     def test_200_is_reachable(self, monkeypatch):
         resp = MagicMock(status_code=200)
         monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
-        assert V.url_reachable("https://example.com") is True
+        assert V.url_reachable(_CWE_URL) is True
 
     def test_404_is_not_reachable(self, monkeypatch):
         resp = MagicMock(status_code=404)
         monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
-        assert V.url_reachable("https://example.com/missing") is False
+        assert V.url_reachable(_CWE_URL) is False
 
     def test_timeout_is_not_reachable(self, monkeypatch):
         def boom(*a, **k):
             raise V.requests.exceptions.Timeout("slow")
         monkeypatch.setattr(V.requests, "head", boom)
-        assert V.url_reachable("https://example.com") is False
+        assert V.url_reachable(_CWE_URL) is False
 
     def test_3xx_counts_as_reachable(self, monkeypatch):
         resp = MagicMock(status_code=301)
         monkeypatch.setattr(V.requests, "head", lambda *a, **k: resp)
-        assert V.url_reachable("https://example.com") is True
+        assert V.url_reachable(_CWE_URL) is True
+
+
+class TestCWEUrlAllowlist:
+    """SSRF guard (CWE-918): url_reachable must refuse to fetch anything that
+    is not an https cwe.mitre.org URL, and must do so *without* a request."""
+
+    def test_foreign_host_never_fetched(self, monkeypatch):
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: pytest.fail(
+            "must not issue a request for a non-allowlisted host"))
+        assert V.url_reachable("https://attacker.internal/data") is False
+
+    def test_internal_metadata_endpoint_blocked(self, monkeypatch):
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: pytest.fail(
+            "must not reach an internal address"))
+        assert V.url_reachable("https://169.254.169.254/latest/meta-data") is False
+
+    def test_http_scheme_rejected(self, monkeypatch):
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: pytest.fail(
+            "must not fetch a plain-http URL"))
+        assert V.url_reachable("http://cwe.mitre.org/data/definitions/89.html") is False
+
+    def test_userinfo_confusion_rejected(self, monkeypatch):
+        # Host is attacker.internal; cwe.mitre.org is only the userinfo.
+        monkeypatch.setattr(V.requests, "head", lambda *a, **k: pytest.fail(
+            "must not be fooled by userinfo@host tricks"))
+        assert V.url_reachable(
+            "https://cwe.mitre.org@attacker.internal/x") is False
+
+    def test_non_string_rejected(self):
+        assert V.url_reachable(None) is False  # type: ignore[arg-type]
 
 
 # ---------- Test syntax ----------
