@@ -308,6 +308,36 @@ def _minimal_covering_dirs(paths: list[str]) -> list[str]:
 
 # ---------- Scanner ----------
 
+def _worktree_common_dir(root: Path) -> str | None:
+    """Return the main repo's git dir if `root` is a genuine linked worktree.
+
+    `.git` is repo content: a hand-written `gitdir:`/`commondir` pair makes
+    git report any repo's git dir as the common dir, and that dir would then
+    be mounted into the scanner container. A worktree created by
+    `git worktree add` has its git dir at `<common>/worktrees/<name>`, and
+    that dir's `gitdir` file points back at `<root>/.git`; anything else, or
+    git < 2.31 echoing the unknown `--path-format` flag, returns None.
+    """
+    common = _git_cmd(root, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir")
+    git_dir = _git_cmd(root, "rev-parse", "--path-format=absolute",
+                       "--absolute-git-dir")
+    if "\n" in common or "\n" in git_dir:
+        return None
+    common_path, git_dir_path = Path(common), Path(git_dir)
+    if not (common_path.is_absolute() and git_dir_path.is_absolute()):
+        return None
+    if git_dir_path.parent.resolve() != (common_path / "worktrees").resolve():
+        return None
+    try:
+        back = Path((git_dir_path / "gitdir").read_text().strip())
+    except OSError:
+        return None
+    if back.resolve() != (root / ".git").resolve():
+        return None
+    return common
+
+
 def _scan_layout(project_root: Path) -> tuple[str, list[str]]:
     """Return the project's path inside the scanner container and its mounts.
 
@@ -326,8 +356,7 @@ def _scan_layout(project_root: Path) -> tuple[str, list[str]]:
     mount = ["-v", f"{root}:/usr/src:ro"]
     if not (project_root / ".git").is_file():
         return "/usr/src", mount
-    common = _git_cmd(project_root, "rev-parse", "--path-format=absolute",
-                      "--git-common-dir")
+    common = _worktree_common_dir(root)
     if not common:
         return "/usr/src", mount
     return str(root), ["-v", f"{root}:{root}:ro",

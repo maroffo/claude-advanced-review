@@ -118,3 +118,11 @@ class TestRunSemgrep:
                       targets=["infra/main.tf", ".github/workflows/ci.yml"])
         assert self._scan_targets(mock_run.call_args[0][0]) == [
             "/src/infra/main.tf", "/src/.github/workflows/ci.yml"]
+
+    @patch("subprocess.run")
+    def test_empty_targets_scan_nothing(self, mock_run):
+        # A deletion-only diff leaves no files to scan. Falling back to the
+        # whole repo would time out and report 0 findings again.
+        out = S.run_semgrep(Path("/fake/repo"), targets=[])
+        mock_run.assert_not_called()
+        assert S.parse_output(out) == []

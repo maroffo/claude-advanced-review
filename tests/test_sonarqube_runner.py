@@ -291,6 +291,40 @@ class TestEnsureRunning:
 
 # ---------- run_scan tests ----------
 
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a real repo and a linked worktree of it; return both roots."""
+    main = (tmp_path / "main").resolve()
+    main.mkdir()
+    _git(main, "init", "-q")
+    _git(main, "-c", "user.name=t", "-c", "user.email=t@example.com",
+         "commit", "-q", "--allow-empty", "-m", "init")
+    worktree = tmp_path.resolve() / "wt"
+    _git(main, "worktree", "add", "-q", "-b", "wt", str(worktree))
+    return main, worktree
+
+
+def _scanner_cmd(project_root: Path, **kwargs) -> list[str]:
+    """Run run_scan with real git but a fake docker; return the docker cmd."""
+    real_run = subprocess.run
+    docker_calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kw):
+        if cmd and cmd[0] == "docker":
+            docker_calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return real_run(cmd, *args, **kw)
+
+    with patch("subprocess.run", side_effect=fake_run):
+        SQ.run_scan(project_root, "my-project", "tok-123",
+                    "http://localhost:9000", **kwargs)
+    assert len(docker_calls) == 1
+    return docker_calls[0]
+
+
 class TestRunScan:
     @patch("subprocess.run")
     def test_calls_scanner_with_correct_args(self, mock_run):
@@ -317,29 +351,47 @@ class TestRunScan:
                              "http://localhost:9000")
         assert result is False
 
-    @patch("runner.sonarqube_runner._git_cmd",
-           return_value="/host/main-repo/.git")
-    @patch("subprocess.run")
-    def test_linked_worktree_keeps_host_paths(self, mock_run, mock_git,
-                                              tmp_path):
+    def test_linked_worktree_keeps_host_paths(self, tmp_path):
         # A linked worktree's .git is a file pointing into the main repo's git
         # dir, and that git dir records the worktree's host path as its work
         # tree. JGit needs both at their host paths: without the git dir the
         # scan exits 3 (RepositoryNotFoundException), and with the worktree
         # only at /usr/src every file is "ignored because of scm ignore
         # settings", so nothing is analyzed.
-        root = tmp_path.resolve()
-        (root / ".git").write_text(
-            "gitdir: /host/main-repo/.git/worktrees/wt\n")
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        SQ.run_scan(root, "my-project", "tok-123", "http://localhost:9000",
-                    sources=["infra/modules"])
-        cmd = mock_run.call_args[0][0]
-        assert "/host/main-repo/.git:/host/main-repo/.git:ro" in cmd
-        assert f"{root}:{root}:ro" in cmd
-        assert f"-Dsonar.projectBaseDir={root}" in cmd
-        assert f"-Dsonar.sources={root}/infra/modules" in cmd
+        main, worktree = _linked_worktree(tmp_path)
+        cmd = _scanner_cmd(worktree, sources=["infra/modules"])
+        assert f"{main}/.git:{main}/.git:ro" in cmd
+        assert f"{worktree}:{worktree}:ro" in cmd
+        assert f"-Dsonar.projectBaseDir={worktree}" in cmd
+        assert f"-Dsonar.sources={worktree}/infra/modules" in cmd
         assert not any(":/usr/src" in arg for arg in cmd)
+
+    def test_planted_git_file_does_not_mount_another_repo(self, tmp_path):
+        # `.git` is repo content. A hand-written gitdir/commondir pair makes
+        # git report any repo's git dir as the common dir; mounting it would
+        # hand that repo (config included) to the scanner container.
+        other = (tmp_path / "other").resolve()
+        other.mkdir()
+        _git(other, "init", "-q")
+        root = (tmp_path / "planted").resolve()
+        (root / "g").mkdir(parents=True)
+        (root / ".git").write_text("gitdir: ./g\n")
+        (root / "g" / "HEAD").write_text("ref: refs/heads/x\n")
+        (root / "g" / "commondir").write_text(f"{other}/.git\n")
+        cmd = _scanner_cmd(root)
+        assert f"{root}:/usr/src:ro" in cmd
+        assert not any(str(other) in arg for arg in cmd)
+
+    @patch("runner.sonarqube_runner._git_cmd",
+           return_value="--path-format=absolute\n.git")
+    def test_unusable_git_output_falls_back_to_usr_src(self, mock_git,
+                                                        tmp_path):
+        # git < 2.31 echoes the unknown --path-format flag back on stdout.
+        root = tmp_path.resolve()
+        (root / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")
+        cmd = _scanner_cmd(root)
+        assert f"{root}:/usr/src:ro" in cmd
+        assert not any("sonar.projectBaseDir" in arg for arg in cmd)
 
     @patch("runner.sonarqube_runner._git_cmd")
     @patch("subprocess.run")
