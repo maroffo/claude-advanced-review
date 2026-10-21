@@ -269,7 +269,10 @@ def pipeline(args: argparse.Namespace) -> int:
     semgrep_findings: list[dict] = []
     if not args.no_semgrep:
         print("semgrep: running...", file=sys.stderr)
-        raw = SR.run_semgrep(project_root)
+        raw = SR.run_semgrep(
+            project_root,
+            targets=SQ.changed_paths(project_root, args.diff_mode, args.base),
+        )
         semgrep_findings = SR.parse_output(raw)
         (work_dir / "semgrep.json").write_text(
             json.dumps({"findings": semgrep_findings}, indent=2))

@@ -212,11 +212,12 @@ def generate_project_key(project_root: Path) -> str:
 
 # ---------- Diff scoping ----------
 
-def _changed_paths(project_root: Path, diff_mode: str,
-                   base_ref: str) -> list[str]:
+def changed_paths(project_root: Path, diff_mode: str,
+                  base_ref: str) -> list[str]:
     """Return changed files in the diff as repo-root-relative paths.
 
-    Mirrors orchestrator.generate_diff modes:
+    Shared by the SonarQube scope below and the orchestrator's Semgrep
+    targets. Mirrors orchestrator.generate_diff modes:
     - "staged"  -> `git diff --cached --name-only`
     - "all"     -> `git diff HEAD --name-only`
     - "branch"  -> `git diff ${base}...HEAD --name-only`
@@ -552,7 +553,7 @@ def run_sonarqube(project_root: Path, timeout: int = 1800,
 
     sources: list[str] | None = None
     if diff_mode is not None:
-        changed = _changed_paths(project_root, diff_mode,
+        changed = changed_paths(project_root, diff_mode,
                                  base_ref or "main")
         sources = _minimal_covering_dirs(changed) or None
 

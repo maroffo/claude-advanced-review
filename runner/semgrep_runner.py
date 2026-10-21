@@ -90,14 +90,21 @@ def parse_output(raw: str) -> list[dict]:
 
 # ---------- Execution ----------
 
-def run_semgrep(project_root: Path, timeout: int = 300) -> str:
-    """Run Semgrep in Docker against the project, return raw JSON output."""
+def run_semgrep(project_root: Path, timeout: int = 300,
+                targets: list[str] | None = None) -> str:
+    """Run Semgrep in Docker against the project, return raw JSON output.
+
+    Pass `targets` (repo-root-relative files, e.g. the files of a diff) to
+    scan only those. Without them the whole project is scanned, which on a
+    monorepo exceeds the timeout and yields no findings at all.
+    """
+    paths = [f"/src/{t}" for t in targets] if targets else ["/src"]
     cmd = [
         "docker", "run", "--rm",
         "-v", f"{project_root.resolve()}:/src:ro",
         "--workdir", "/src",
         SEMGREP_IMAGE,
-        "semgrep", SEMGREP_CONFIG, "--json", "--quiet", "/src",
+        "semgrep", SEMGREP_CONFIG, "--json", "--quiet", *paths,
     ]
     try:
         proc = subprocess.run(

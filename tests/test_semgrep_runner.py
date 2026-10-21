@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 from runner import semgrep_runner as S
@@ -92,3 +94,27 @@ class TestParseSemgrepOutput:
     def test_malformed_json_returns_empty(self):
         out = S.parse_output("not json at all")
         assert out == []
+
+
+class TestRunSemgrep:
+    @staticmethod
+    def _scan_targets(cmd: list[str]) -> list[str]:
+        return cmd[cmd.index("--quiet") + 1:]
+
+    @patch("subprocess.run")
+    def test_scans_whole_project_without_targets(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}",
+                                          stderr="")
+        S.run_semgrep(Path("/fake/repo"))
+        assert self._scan_targets(mock_run.call_args[0][0]) == ["/src"]
+
+    @patch("subprocess.run")
+    def test_scans_only_the_given_targets(self, mock_run):
+        # A diff review must not scan the whole repo: on a monorepo that
+        # exceeds the timeout and silently reports 0 findings.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}",
+                                          stderr="")
+        S.run_semgrep(Path("/fake/repo"),
+                      targets=["infra/main.tf", ".github/workflows/ci.yml"])
+        assert self._scan_targets(mock_run.call_args[0][0]) == [
+            "/src/infra/main.tf", "/src/.github/workflows/ci.yml"]
