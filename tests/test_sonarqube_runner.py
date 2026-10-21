@@ -317,6 +317,45 @@ class TestRunScan:
                              "http://localhost:9000")
         assert result is False
 
+    @patch("runner.sonarqube_runner._git_cmd",
+           return_value="/host/main-repo/.git")
+    @patch("subprocess.run")
+    def test_linked_worktree_keeps_host_paths(self, mock_run, mock_git,
+                                              tmp_path):
+        # A linked worktree's .git is a file pointing into the main repo's git
+        # dir, and that git dir records the worktree's host path as its work
+        # tree. JGit needs both at their host paths: without the git dir the
+        # scan exits 3 (RepositoryNotFoundException), and with the worktree
+        # only at /usr/src every file is "ignored because of scm ignore
+        # settings", so nothing is analyzed.
+        root = tmp_path.resolve()
+        (root / ".git").write_text(
+            "gitdir: /host/main-repo/.git/worktrees/wt\n")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        SQ.run_scan(root, "my-project", "tok-123", "http://localhost:9000",
+                    sources=["infra/modules"])
+        cmd = mock_run.call_args[0][0]
+        assert "/host/main-repo/.git:/host/main-repo/.git:ro" in cmd
+        assert f"{root}:{root}:ro" in cmd
+        assert f"-Dsonar.projectBaseDir={root}" in cmd
+        assert f"-Dsonar.sources={root}/infra/modules" in cmd
+        assert not any(":/usr/src" in arg for arg in cmd)
+
+    @patch("runner.sonarqube_runner._git_cmd")
+    @patch("subprocess.run")
+    def test_regular_checkout_mounts_at_usr_src(self, mock_run, mock_git,
+                                                tmp_path):
+        root = tmp_path.resolve()
+        (root / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        SQ.run_scan(root, "my-project", "tok-123", "http://localhost:9000",
+                    sources=["infra/modules"])
+        cmd = mock_run.call_args[0][0]
+        assert f"{root}:/usr/src:ro" in cmd
+        assert "-Dsonar.sources=/usr/src/infra/modules" in cmd
+        assert not any("sonar.projectBaseDir" in arg for arg in cmd)
+        mock_git.assert_not_called()
+
 
 # ---------- cleanup_old_projects tests ----------
 
