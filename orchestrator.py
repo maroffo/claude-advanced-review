@@ -451,14 +451,16 @@ def _parse_findings(raws: tuple[tuple[str, str, str], ...],
 
 
 def _run_semgrep_stage(no_semgrep: bool, scan_root: Path,
-                       work_dir: Path | None = None) -> list[dict]:
+                       work_dir: Path | None = None,
+                       targets: list[str] | None = None) -> list[dict]:
     """Run Semgrep against `scan_root` (the --repo subpath in repo mode, the
-    project root in diff mode) and map to the finding schema. Persists
+    project root in diff mode) and map to the finding schema. Diff mode
+    passes the diff's files as `targets` so only they are scanned. Persists
     semgrep.json only when `work_dir` is given (diff mode)."""
     if no_semgrep:
         return []
     print("semgrep: running...", file=sys.stderr)
-    raw = SR.run_semgrep(scan_root)
+    raw = SR.run_semgrep(scan_root, targets=targets)
     findings = SR.parse_output(raw)
     if work_dir is not None:
         (work_dir / "semgrep.json").write_text(
@@ -624,8 +626,10 @@ def pipeline(args: argparse.Namespace) -> int:
     print(f"after test runner: {len(surviving)} surviving", file=sys.stderr)
 
     # 5) Semgrep (parallel with step 4 in a follow-up; sequential for v1)
-    semgrep_findings = _run_semgrep_stage(args.no_semgrep, project_root,
-                                          work_dir)
+    semgrep_findings = _run_semgrep_stage(
+        args.no_semgrep, project_root, work_dir,
+        targets=SQ.changed_paths(project_root, args.diff_mode, args.base),
+    )
 
     # 5b) SonarQube (opt-in ground truth, persistent container)
     sonar_findings = _run_sonarqube_stage(args, project_root,

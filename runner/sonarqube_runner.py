@@ -246,11 +246,12 @@ def generate_project_key(project_root: Path) -> str:
 
 # ---------- Diff scoping ----------
 
-def _changed_paths(project_root: Path, diff_mode: str,
-                   base_ref: str) -> list[str]:
+def changed_paths(project_root: Path, diff_mode: str,
+                  base_ref: str) -> list[str]:
     """Return changed files in the diff as repo-root-relative paths.
 
-    Mirrors orchestrator.generate_diff modes:
+    Shared by the SonarQube scope below and the orchestrator's Semgrep
+    targets. Mirrors orchestrator.generate_diff modes:
     - "staged"  -> `git diff --cached --name-only`
     - "all"     -> `git diff HEAD --name-only`
     - "branch"  -> `git diff ${base}...HEAD --name-only`
@@ -341,6 +342,62 @@ def _minimal_covering_dirs(paths: list[str]) -> list[str]:
 
 # ---------- Scanner ----------
 
+def _worktree_common_dir(root: Path) -> str | None:
+    """Return the main repo's git dir if `root` is a genuine linked worktree.
+
+    `.git` is repo content: a hand-written `gitdir:`/`commondir` pair makes
+    git report any repo's git dir as the common dir, and that dir would then
+    be mounted into the scanner container. A worktree created by
+    `git worktree add` has its git dir at `<common>/worktrees/<name>`, and
+    that dir's `gitdir` file points back at `<root>/.git`; anything else, or
+    git < 2.31 echoing the unknown `--path-format` flag, returns None.
+    """
+    common = _git_cmd(root, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir")
+    git_dir = _git_cmd(root, "rev-parse", "--path-format=absolute",
+                       "--absolute-git-dir")
+    if "\n" in common or "\n" in git_dir:
+        return None
+    common_path, git_dir_path = Path(common), Path(git_dir)
+    if not (common_path.is_absolute() and git_dir_path.is_absolute()):
+        return None
+    if git_dir_path.parent.resolve() != (common_path / "worktrees").resolve():
+        return None
+    try:
+        back = Path((git_dir_path / "gitdir").read_text().strip())
+    except OSError:
+        return None
+    if back.resolve() != (root / ".git").resolve():
+        return None
+    return common
+
+
+def _scan_layout(project_root: Path) -> tuple[str, list[str]]:
+    """Return the project's path inside the scanner container and its mounts.
+
+    A regular checkout is mounted at the image's /usr/src. A linked worktree
+    cannot be: its `.git` is a file whose `gitdir:` points into the main
+    repo's git dir on the host, and that git dir records the worktree's host
+    path as its work tree. With only /usr/src mounted, JGit either fails with
+    RepositoryNotFoundException (scan exit 3) or, once the git dir is
+    mounted, sees no tracked files and Sonar skips every file as "ignored
+    because of scm ignore settings". Mounting both read-only at their host
+    paths keeps the SCM sensor working, including its exclusion of
+    git-ignored files; disabling SCM instead would let Sonar analyze ignored
+    files such as `.terraform/`.
+    """
+    root = project_root.resolve()
+    mount = ["-v", f"{root}:/usr/src:ro"]
+    if not (project_root / ".git").is_file():
+        return "/usr/src", mount
+    common = _worktree_common_dir(root)
+    if not common:
+        return "/usr/src", mount
+    return str(root), ["-v", f"{root}:{root}:ro",
+                       "-v", f"{common}:{common}:ro",
+                       "-w", str(root)]
+
+
 def run_scan(project_root: Path, project_key: str, token: str,
              sonar_url: str = SONAR_URL, timeout: int = 1800,
              sources: list[str] | None = None) -> bool:
@@ -353,15 +410,16 @@ def run_scan(project_root: Path, project_key: str, token: str,
     project scan.
     """
     scan_id = uuid.uuid4().hex[:8]
+    base, mounts = _scan_layout(project_root)
     if sources:
         # Translate repo-root-relative paths into mount-relative paths so
         # SonarQube sees only the changed subtree. Comma-separated list per
         # the scanner CLI contract.
-        scoped = ",".join(f"/usr/src/{s}" if s != "." else "/usr/src"
+        scoped = ",".join(f"{base}/{s}" if s != "." else base
                           for s in sources)
         sources_arg = f"-Dsonar.sources={scoped}"
     else:
-        sources_arg = "-Dsonar.sources=/usr/src"
+        sources_arg = f"-Dsonar.sources={base}"
     # Even when `sonar.sources` is scoped, SonarJS does a project-wide
     # tsconfig discovery for cross-file type resolution. Without these
     # exclusions the scanner pulls in stale `.claude/worktrees/` (Agent
@@ -385,7 +443,7 @@ def run_scan(project_root: Path, project_key: str, token: str,
         "--add-host", f"{SCANNER_HOST_ALIAS}:host-gateway",
         "-e", f"SONAR_HOST_URL={scanner_host_url}",
         "-e", f"SONAR_TOKEN={token}",
-        "-v", f"{project_root.resolve()}:/usr/src:ro",
+        *mounts,
         SCANNER_IMAGE,
         f"-Dsonar.projectKey={project_key}",
         f"-Dsonar.projectName={project_key}",
@@ -394,6 +452,8 @@ def run_scan(project_root: Path, project_key: str, token: str,
         "-Dsonar.qualitygate.wait=true",
         f"-Dsonar.working.dir=/tmp/.scannerwork-{scan_id}",
     ]
+    if base != "/usr/src":
+        cmd.append(f"-Dsonar.projectBaseDir={base}")
     # When scoped, pin the tsconfig list to the configs nearest each
     # source dir. SonarJS ignores `sonar.exclusions` for tsconfig discovery,
     # so without this override it still crawls into stale worktree
@@ -401,7 +461,7 @@ def run_scan(project_root: Path, project_key: str, token: str,
     if sources:
         tsconfigs = _find_tsconfigs(project_root, sources)
         if tsconfigs:
-            mounted = ",".join(f"/usr/src/{tc}" for tc in tsconfigs)
+            mounted = ",".join(f"{base}/{tc}" for tc in tsconfigs)
             cmd.append(f"-Dsonar.typescript.tsconfigPaths={mounted}")
     try:
         proc = subprocess.run(
@@ -568,7 +628,7 @@ def run_sonarqube(project_root: Path, timeout: int = 1800,
 
     sources: list[str] | None = None
     if diff_mode is not None:
-        changed = _changed_paths(project_root, diff_mode,
+        changed = changed_paths(project_root, diff_mode,
                                  base_ref or "main")
         sources = _minimal_covering_dirs(changed) or None
 
